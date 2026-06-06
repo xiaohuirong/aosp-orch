@@ -48,7 +48,8 @@ def run_cli(*args) -> subprocess.CompletedProcess:
 
 def run_link(name="xxx", repo_url="https://github.com/mock/manifest.git",
              repo_branch="main", docker_image="aosp-builder:mock",
-             base_lv_size_gb=1, base_mount_path="/tmp/aosp_workspaces/xxx/base_mount"):
+             base_lv_size_gb=1, base_mount_path="/tmp/aosp_workspaces/xxx/base_mount",
+             sync_type="repo"):
     """Run link command with all params (non-interactive)."""
     return run_cli(
         "link",
@@ -58,6 +59,7 @@ def run_link(name="xxx", repo_url="https://github.com/mock/manifest.git",
         "--docker-image", docker_image,
         "--base-lv-size-gb", str(base_lv_size_gb),
         "--base-mount-path", base_mount_path,
+        "--sync-type", sync_type,
     )
 
 

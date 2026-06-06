@@ -178,6 +178,26 @@ def ensure_pool_and_vg(config: dict) -> str | None:
     return loop_dev
 
 
+def _run_sync(c_name: str, bp: dict) -> None:
+    """Run sync commands inside a container based on project's sync_type.
+
+    sync_type: "repo" (default) or "git"
+    - repo: repo init -u <url> -b <branch> && repo sync
+    - git: git clone -b <branch> <url> <project_name>
+    """
+    sync_type = bp.get("sync_type", "repo")
+    project_dir = bp["name"]
+    repo_url = bp["repo_url"]
+    repo_branch = bp["repo_branch"]
+
+    if sync_type == "git":
+        docker_exec(c_name, f"cd / && git clone -b {repo_branch} {repo_url} {project_dir}")
+    else:
+        # Default: repo
+        docker_exec(c_name, f"cd /{project_dir} && repo init -u {repo_url} -b {repo_branch}")
+        docker_exec(c_name, f"cd /{project_dir} && repo sync")
+
+
 def _ensure_base_lv(config: dict, bp: dict) -> None:
     """Lazy-init: ensure pool, VG, base LV exist, are formatted, mounted, and populated.
 
@@ -225,8 +245,7 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
             if docker_container_exists(c_name):
                 docker_rm(c_name)
             docker_run(c_name, base_mount_path, f"/{bp['name']}", docker_image)
-            docker_exec(c_name, f"cd /{bp['name']} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
-            docker_exec(c_name, f"cd /{bp['name']} && repo sync")
+            _run_sync(c_name, bp)
             for cmd in build_config.get("setup_commands", []):
                 docker_exec(c_name, f"cd /{bp['name']} && {cmd}")
             compile_cmd = build_config.get("compile_command", "")
@@ -336,8 +355,10 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
 @click.option("--docker-image", default=None, help="Docker 镜像名称")
 @click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
 @click.option("--base-mount-path", default=None, help="基底卷挂载路径")
+@click.option("--sync-type", type=click.Choice(["repo", "git"]), default=None,
+              help="代码同步方式: repo (默认) | git")
 @click.pass_context
-def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path):
+def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path, sync_type):
     """交互式或参数化配置 base project（仅写配置，不触发 LVM 操作）。"""
     config_path = ctx.obj["config_path"]
 
@@ -359,7 +380,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
     mode = g["mode"]
 
     # Check if all link-specific options are provided
-    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path])
+    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path, sync_type])
 
     if all_provided:
         # Non-interactive: use provided values
@@ -384,6 +405,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         bp["name"] = bp_name
         bp["repo_url"] = repo_url or "https://android.googlesource.com/platform/manifest"
         bp["repo_branch"] = repo_branch or "main"
+        bp["sync_type"] = sync_type or "repo"
         bp["docker_image"] = docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest")
         bp["base_lv_name"] = f"{bp_name}_base_lv"
         bp["base_lv_size_gb"] = base_lv_size_gb or (1 if mode == "mock" else 100)
@@ -406,6 +428,8 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
             bp["repo_url"] = repo_url
         if repo_branch is not None:
             bp["repo_branch"] = repo_branch
+        if sync_type is not None:
+            bp["sync_type"] = sync_type
         if docker_image is not None:
             bp["docker_image"] = docker_image
         if base_lv_size_gb is not None:
@@ -417,6 +441,8 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         # Interactive: let user review/edit key fields
         bp["repo_url"] = click.prompt("清单仓库地址", default=bp["repo_url"])
         bp["repo_branch"] = click.prompt("清单分支", default=bp["repo_branch"])
+        bp.setdefault("sync_type", "repo")
+        bp["sync_type"] = click.prompt("同步方式 (repo/git)", default=bp["sync_type"])
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
         bp["base_mount_path"] = click.prompt("基底卷挂载路径", default=bp["base_mount_path"])
@@ -465,7 +491,7 @@ def create(ctx, workspace_name, base):
 def activate(ctx, workspace_name):
     """Activate a workspace (lazy snapshot + mount + container)."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
 
@@ -534,7 +560,7 @@ def activate(ctx, workspace_name):
 def enter(ctx, workspace_name):
     """Enter a workspace container interactively."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
 
     bp = None
     ws = None
@@ -563,7 +589,7 @@ def enter(ctx, workspace_name):
 def deactivate(ctx, workspace_name):
     """Deactivate a workspace (stop container + unmount)."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
 
@@ -607,7 +633,7 @@ def deactivate(ctx, workspace_name):
 def remove(ctx, workspace_name):
     """Remove a workspace entirely (deactivate + destroy snapshot)."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
 
@@ -655,7 +681,7 @@ def remove(ctx, workspace_name):
 def sync(ctx, base):
     """Force re-sync and re-compile the base (destroys all workspaces)."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
     mode = g["mode"]
@@ -704,8 +730,7 @@ def sync(ctx, base):
         if docker_container_exists(c_name):
             docker_rm(c_name)
         docker_run(c_name, base_mount_path, f"/{base}", docker_image)
-        docker_exec(c_name, f"cd /{base} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
-        docker_exec(c_name, f"cd /{base} && repo sync")
+        _run_sync(c_name, bp)
         for cmd in build_config.get("setup_commands", []):
             docker_exec(c_name, f"cd /{base} && {cmd}")
         compile_cmd = build_config.get("compile_command", "")
