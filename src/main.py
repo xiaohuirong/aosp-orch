@@ -529,7 +529,8 @@ def activate(ctx, workspace_name, base):
     ws = get_workspace(bp, workspace_name)
     if ws is None:
         # Auto-create workspace if not exists
-        click.echo(f"Workspace '{workspace_name}' not found, auto-creating...")
+        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
+            sys.exit(0)
         ws = {"name": workspace_name}
         bp.setdefault("workspaces", []).append(ws)
         save_config(config, config_path)
@@ -595,11 +596,16 @@ def enter(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
-        sys.exit(1)
+        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
+            sys.exit(0)
+        ws = {"name": workspace_name}
+        bp.setdefault("workspaces", []).append(ws)
+        save_config(config, config_path)
+        click.echo(f"Workspace '{workspace_name}' created.")
 
     if not _is_workspace_active(base, workspace_name):
-        click.echo(f"Workspace '{workspace_name}' is not active, auto-activating...")
+        if not click.confirm(f"Workspace '{workspace_name}' 未激活，是否激活?", default=True):
+            sys.exit(0)
         ctx.invoke(activate, workspace_name=workspace_name, base=base)
 
     c_name = container_name(bp["name"], workspace_name)
@@ -707,7 +713,7 @@ def sync(ctx, base):
     base_mount_path = _base_mount_path(config, project_name)
     docker_image = bp["docker_image"]
 
-    # 1. Destroy all workspaces
+    # 1. Destroy all workspace snapshots and containers (keep config entries)
     workspaces = list(bp.get("workspaces", []))
     for ws in workspaces:
         ws_name = ws["name"]
@@ -720,10 +726,6 @@ def sync(ctx, base):
         snapshot_lv_name = _snapshot_lv_name(ws_name)
         if lv_exists(VG_NAME, snapshot_lv_name):
             remove_lv(VG_NAME, snapshot_lv_name)
-
-    # Clear workspaces from config
-    bp["workspaces"].clear()
-    save_config(config, config_path)
 
     # 2. Ensure base LV exists (lazy) — this leaves base LV unmounted
     _ensure_base_lv(config, bp)

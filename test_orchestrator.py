@@ -384,16 +384,14 @@ class TestAssertion4ForceSync:
         assert not lv_exists(VG_NAME, _snapshot_lv_name("a")), \
             "a_snapshot_lv still exists after sync"
 
-        # Assert: workspaces cleared from config
+        # Assert: workspaces kept in config (sync no longer deletes config entries)
         config = read_config()
         bp = config["base_projects"][0]
-        assert len(bp.get("workspaces", [])) == 0, \
-            "Workspaces not cleared from config after sync"
+        ws_names = [w["name"] for w in bp.get("workspaces", [])]
+        assert "a" in ws_names and "b" in ws_names, \
+            "Workspaces should still exist in config after sync"
 
-        # Re-create and activate b to verify lazy reload
-        result = run_cli("create", "b", "--base", "xxx")
-        assert result.returncode == 0, f"re-create b failed: {result.stderr}"
-
+        # Re-activate b to verify lazy reload (no need to re-create)
         result = run_cli("activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
