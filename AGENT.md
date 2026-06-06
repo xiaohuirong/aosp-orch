@@ -13,7 +13,7 @@
 ```
 aosp-env/
 ├── AGENT.md              # 本文档（项目上下文）
-├── config.toml           # 标准配置文件
+├── config.yaml           # YAML 配置文件
 ├── src/
 │   ├── main.py           # CLI 入口（Click），所有命令
 │   └── storage.py        # 底层 LVM/Loop/Mount/Docker 操作封装
@@ -22,39 +22,50 @@ aosp-env/
 
 ---
 
-## 三、 配置文件 (`config.toml`)
+## 三、 配置文件 (`config.yaml`)
 
-配置路径优先级：`--config` 参数 > `AOSP_ORCH_CONFIG` 环境变量 > `~/.config/aosp-orch/config.toml`
+配置路径优先级：`--config` 参数 > `AOSP_ORCH_CONFIG` 环境变量 > `~/.config/aosp-orch/config.yaml`
 
 配置修改必须原子化（先写 `.tmp` 再 `rename`）。
 
-```toml
-[global]
-version = "3.2.0"
-mode = "mock"
-pool_image_path = "/aosp_pool.img"
-pool_image_size_gb = 2
-lvm_vg_name = "vgaosp_pool"
-thin_pool_name = "aosp_thin_pool"
+```yaml
+global:
+  mode: mock
+  workdir: /tmp/aosp_workspaces
+  pool_image_size_gb: 2
 
-[[base_projects]]
-name = "xxx"
-repo_url = "https://github.com/mock/manifest.git"
-repo_branch = "main"
-docker_image = "aosp-builder:mock"
-base_lv_name = "xxx_base_lv"
-base_lv_size_gb = 1
-base_mount_path = "/tmp/aosp_workspaces/xxx/base_mount"
-
-[base_projects.build_config]
-setup_commands = ["source build/envsetup.sh", "lunch mock_target-eng"]
-compile_command = "m -j$(nproc)"
-
-[base_projects.build_config.env_vars]
-USE_CCACHE = "1"
+base_projects:
+  - name: xxx
+    repo_url: https://github.com/mock/manifest.git
+    repo_branch: main
+    docker_image: aosp-builder:mock
+    base_lv_size_gb: 1
+    build_config:
+      setup_commands:
+        - source build/envsetup.sh
+        - lunch mock_target-eng
+      compile_command: m -j$(nproc)
+      env_vars:
+        USE_CCACHE: "1"
+    workspaces: []
 ```
 
-**TOML 格式要点：** `base_projects` 必须用 `[[base_projects]]` 数组项语法，嵌套子表用 `[base_projects.build_config]`，不能用内联数组 `base_projects = [...]`。代码中使用 `tomlkit.aot()` 而非 `[]` 初始化。
+### 设计原则：配置文件只存用户需要关心的内容
+
+**硬编码常量**（不存配置、不问用户）：
+- `lvm_vg_name` = `vgaosp_pool`
+- `thin_pool_name` = `aosp_thin_pool`
+- `pool_image_filename` = `aosp_pool.img`
+
+**自动推导路径**（从 `workdir` + 项目名/工作区名计算，不存配置）：
+
+| 字段 | 生成规则 | 示例（workdir=/tmp/aosp_workspaces, project=xxx） |
+|---|---|---|
+| pool image | `{workdir}/aosp_pool.img` | `/tmp/aosp_workspaces/aosp_pool.img` |
+| base_lv_name | `{project}_base_lv` | `xxx_base_lv` |
+| base_mount_path | `{workdir}/{project}/base_mount` | `/tmp/aosp_workspaces/xxx/base_mount` |
+| snapshot_lv_name | `{workspace}_snapshot_lv` | `a_snapshot_lv` |
+| workspace mount | `{workdir}/{project}/{workspace}` | `/tmp/aosp_workspaces/xxx/a` |
 
 ---
 
@@ -63,25 +74,24 @@ USE_CCACHE = "1"
 ### 全局选项
 
 ```
---config PATH    指定配置文件路径
+--config PATH    指定配置文件路径（默认 ~/.config/aosp-orch/config.yaml）
 ```
 
 ### `init` —— 初始化全局配置
 
-交互式或全参数初始化 `[global]` 配置。
+交互式或全参数初始化 `global` 配置。只需设置 `mode`、`workdir`、`pool_image_size_gb`。
 
 ```bash
 # 交互式
 python3 src/main.py init
 
 # 全参数
-python3 src/main.py init --mode mock --pool-image-path /aosp_pool.img \
-  --pool-image-size-gb 2 --lvm-vg-name vgaosp_pool --thin-pool-name aosp_thin_pool
+python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 ```
 
 ### `link` —— 配置 base project（仅写配置，不触发 LVM）
 
-交互式或全参数配置 base project。**纯元数据操作**，不创建任何 LVM 资源。LVM 操作延迟到 `activate`/`sync`/`compile` 时懒加载执行。
+交互式或全参数配置 base project。**纯元数据操作**，不创建任何 LVM 资源。LVM 操作延迟到 `activate`/`sync`/`compile` 时懒加载执行。支持 `--sync-type` 选择 repo/git 同步方式。
 
 ```bash
 # 交互式
@@ -89,8 +99,7 @@ python3 src/main.py link
 
 # 全参数
 python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
-  --docker-image aosp-builder:mock --base-lv-size-gb 1 \
-  --base-mount-path /tmp/aosp_workspaces/xxx/base_mount
+  --docker-image aosp-builder:mock --base-lv-size-gb 1 --sync-type repo
 ```
 
 ### `create` —— 创建工作区（纯元数据）
@@ -131,7 +140,7 @@ python3 src/main.py remove <workspace_name>
 
 ### `sync` —— 基底强制更新（清盘流）
 
-销毁所有子工作区，重新拉取/编译基底。
+销毁所有子工作区，重新拉取/编译基底。支持 repo/git 两种同步方式。
 
 ```bash
 python3 src/main.py sync --base <project_name>
@@ -159,6 +168,10 @@ python3 src/main.py compile --base <project_name>
 
 ## 六、 关键技术细节
 
+### 硬编码常量与自动推导
+
+LVM 卷组名、精简池名、所有 LV 名和挂载路径均由代码自动推导，不写入配置文件，减轻用户阅读负担。参见第三节"自动推导路径"表。
+
 ### LVM Thin Snapshot 激活
 
 Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lvchange -K -ay` 才能激活，否则 mount 报 `Can't lookup blockdev` 错误。
@@ -171,21 +184,27 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 ### 配置验证
 
-每个命令执行前应检查配置文件的正确性（`[global]` 必需字段、`base_projects` 结构等）。
+每个命令执行前应检查配置文件的正确性（`global` 必需字段、`base_projects` 结构等）。
+
+### sync_type 支持
+
+base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
+- repo: `repo init -u <url> -b <branch>` + `repo sync`
+- git: `git clone -b <branch> <url> <project_name>`
 
 ---
 
 ## 七、 测试
 
 ```bash
-pytest test_orchestrator.py -v    # 必须输出 9 passed
+python3 -m pytest test_orchestrator.py -v    # 必须输出 9 passed
 ```
 
 ### 9 个测试用例
 
 | 类 | 用例 | 验证内容 |
 |---|---|---|
-| 断言1 | `test_link_writes_config` | link 写入配置 + TOML 格式正确（`[[base_projects]]` 嵌套子表） |
+| 断言1 | `test_link_writes_config` | link 写入配置 + 自动推导字段不存配置 |
 | 断言1 | `test_activate_creates_pool_image` | activate 懒加载创建 pool image |
 | 断言1 | `test_activate_creates_vg_and_base_lv_with_mock_output` | activate 懒加载创建 VG + base LV 含 mock 产物 |
 | 断言2 | `test_workspace_isolation` | 工作区 a 写入的文件在 b 中不可见（块设备级物理隔离） |
@@ -200,4 +219,4 @@ pytest test_orchestrator.py -v    # 必须输出 9 passed
 - Docker 镜像：`alpine:latest` + bash，命名为 `aosp-builder:mock`
 - Pool 大小：2GB（测试用）
 - Base LV 大小：1GB
-- 挂载路径：`/tmp/aosp_workspaces/`
+- 工作目录：`/tmp/aosp_workspaces/`
