@@ -40,10 +40,8 @@ from storage import (
 
 def run_cli(*args) -> subprocess.CompletedProcess:
     """Run the orchestrator CLI."""
-    cmd = [sys.executable, os.path.join(SRC_DIR, "main.py")] + list(args)
-    env = os.environ.copy()
-    env["AOSP_ORCH_CONFIG"] = CONFIG_PATH
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    cmd = [sys.executable, os.path.join(SRC_DIR, "main.py"), "--config", CONFIG_PATH] + list(args)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result
 
 

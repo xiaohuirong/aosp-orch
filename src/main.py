@@ -45,22 +45,32 @@ from storage import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = os.environ.get("AOSP_ORCH_CONFIG", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.toml"))
+DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "aosp-orch")
+DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.toml")
 
 
-def load_config() -> dict:
-    """Load config.toml."""
-    with open(CONFIG_PATH, "r") as f:
+def _resolve_config_path() -> str:
+    """Resolve config path: env var > default ~/.config/aosp-orch/config.toml."""
+    env_path = os.environ.get("AOSP_ORCH_CONFIG")
+    if env_path:
+        return env_path
+    return DEFAULT_CONFIG_PATH
+
+
+def load_config(config_path: str) -> dict:
+    """Load config.toml from the given path."""
+    with open(config_path, "r") as f:
         return tomlkit.load(f)
 
 
-def save_config(config: dict) -> None:
+def save_config(config: dict, config_path: str) -> None:
     """Atomically save config.toml (write to .tmp then rename)."""
-    dir_path = os.path.dirname(CONFIG_PATH)
+    dir_path = os.path.dirname(config_path)
+    os.makedirs(dir_path, exist_ok=True)
     tmp_path = os.path.join(dir_path, ".config.toml.tmp")
     with open(tmp_path, "w") as f:
         tomlkit.dump(config, f)
-    os.rename(tmp_path, CONFIG_PATH)
+    os.rename(tmp_path, config_path)
 
 
 def get_base_project(config: dict, name: str) -> dict | None:
@@ -113,9 +123,17 @@ def ensure_pool_and_vg(config: dict) -> str | None:
 # ── CLI Commands ──────────────────────────────────────────────
 
 @click.group()
-def cli():
+@click.option("--config", "config_path", default=None,
+              help=f"配置文件路径 (默认: {DEFAULT_CONFIG_PATH})")
+@click.pass_context
+def cli(ctx, config_path):
     """AOSP Block Device Build Container Orchestrator"""
-    pass
+    ctx.ensure_object(dict)
+    if config_path:
+        resolved = os.path.abspath(config_path)
+    else:
+        resolved = _resolve_config_path()
+    ctx.obj["config_path"] = resolved
 
 
 @cli.command()
@@ -125,11 +143,14 @@ def cli():
 @click.option("--pool-image-size-gb", type=int, default=None, help="存储池大小 (GB)")
 @click.option("--lvm-vg-name", default=None, help="虚拟卷组名称")
 @click.option("--thin-pool-name", default=None, help="LVM精简配置池名称")
-def init(mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name):
+@click.pass_context
+def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name):
     """交互式或参数化初始化 config.toml 中的 [global] 配置。"""
+    config_path = ctx.obj["config_path"]
+
     # Load existing config or create new one
-    if os.path.exists(CONFIG_PATH):
-        config = load_config()
+    if os.path.exists(config_path):
+        config = load_config(config_path)
     else:
         config = tomlkit.document()
 
@@ -158,7 +179,8 @@ def init(mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name)
     else:
         # Interactive mode
         click.echo("=== 初始化 AOSP 编排器全局配置 ===")
-        click.echo(f"（括号内为当前值/默认值，直接回车保留）\n")
+        click.echo(f"配置文件: {config_path}")
+        click.echo("（括号内为当前值/默认值，直接回车保留）\n")
 
         g["version"] = defaults["version"]
 
@@ -178,8 +200,8 @@ def init(mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name)
     # Ensure base_projects exists
     config.setdefault("base_projects", [])
 
-    save_config(config)
-    click.echo(f"\n配置已保存到 {CONFIG_PATH}")
+    save_config(config, config_path)
+    click.echo(f"\n配置已保存到 {config_path}")
     click.echo("  mode            = %s" % g["mode"])
     click.echo("  pool_image_path = %s" % g["pool_image_path"])
     click.echo("  pool_image_size = %d GB" % g["pool_image_size_gb"])
@@ -189,9 +211,11 @@ def init(mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name)
 
 @cli.command()
 @click.option("--name", required=True, help="Base project name")
-def link(name):
+@click.pass_context
+def link(ctx, name):
     """Initialize and populate the base LV."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     bp = get_base_project(config, name)
     if bp is None:
         click.echo(f"Base project '{name}' not found in config", err=True)
@@ -259,9 +283,11 @@ def link(name):
 @cli.command()
 @click.argument("workspace_name")
 @click.option("--base", required=True, help="Base project name")
-def create(workspace_name, base):
+@click.pass_context
+def create(ctx, workspace_name, base):
     """Create a lightweight workspace (metadata only)."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
@@ -271,8 +297,6 @@ def create(workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' already exists in '{base}'", err=True)
         sys.exit(1)
 
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
     mount_path = os.path.join(
         os.path.dirname(bp["base_mount_path"]),
         workspace_name,
@@ -285,18 +309,19 @@ def create(workspace_name, base):
         "mount_path": mount_path,
     }
     bp.setdefault("workspaces", []).append(new_ws)
-    save_config(config)
+    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' created (inactive).")
 
 
 @cli.command()
 @click.argument("workspace_name")
-def activate(workspace_name):
+@click.pass_context
+def activate(ctx, workspace_name):
     """Activate a workspace (lazy snapshot + mount + container)."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
-    mode = g["mode"]
 
     # Find the workspace across all base projects
     bp = None
@@ -346,15 +371,17 @@ def activate(workspace_name):
 
     # 4. Update status
     ws["status"] = "active"
-    save_config(config)
+    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' activated.")
 
 
 @cli.command()
 @click.argument("workspace_name")
-def enter(workspace_name):
+@click.pass_context
+def enter(ctx, workspace_name):
     """Enter a workspace container interactively."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
 
     bp = None
     ws = None
@@ -379,9 +406,11 @@ def enter(workspace_name):
 
 @cli.command()
 @click.argument("workspace_name")
-def deactivate(workspace_name):
+@click.pass_context
+def deactivate(ctx, workspace_name):
     """Deactivate a workspace (stop container + unmount)."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
 
@@ -415,15 +444,17 @@ def deactivate(workspace_name):
 
     # 3. Update status
     ws["status"] = "inactive"
-    save_config(config)
+    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' deactivated.")
 
 
 @cli.command()
 @click.argument("workspace_name")
-def remove(workspace_name):
+@click.pass_context
+def remove(ctx, workspace_name):
     """Remove a workspace entirely (deactivate + destroy snapshot)."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
 
@@ -461,15 +492,17 @@ def remove(workspace_name):
 
     # 3. Remove from config
     config["base_projects"][bp_idx]["workspaces"].pop(ws_idx)
-    save_config(config)
+    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' removed.")
 
 
 @cli.command()
 @click.option("--base", required=True, help="Base project name")
-def sync(base):
+@click.pass_context
+def sync(ctx, base):
     """Force re-sync and re-compile the base (destroys all workspaces)."""
-    config = load_config()
+    config_path = ctx.obj["config_path"]
+    config = load_config(config_path)
     g = config["global"]
     vg_name = g["lvm_vg_name"]
     mode = g["mode"]
@@ -497,7 +530,7 @@ def sync(base):
 
     # Clear workspaces from config
     bp["workspaces"].clear()
-    save_config(config)
+    save_config(config, config_path)
 
     # 2. Mount base LV
     activate_lv(vg_name, base_lv_name)
@@ -537,9 +570,10 @@ def sync(base):
 
 @cli.command()
 @click.option("--base", required=True, help="Base project name")
-def compile(base):
+@click.pass_context
+def compile(ctx, base):
     """Alias for sync - re-compile the base."""
-    sync([base])
+    ctx.invoke(sync, base=base)
 
 
 if __name__ == "__main__":
