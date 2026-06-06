@@ -1,0 +1,23 @@
+[global]
+version = "3.2.0"
+mode = "mock"
+pool_image_path = "/aosp_pool.img"
+pool_image_size_gb = 2
+lvm_vg_name = "vgaosp_pool"
+thin_pool_name = "aosp_thin_pool"
+
+[[base_projects]]
+name = "xxx"
+repo_url = "https://github.com/mock/manifest.git"
+repo_branch = "main"
+docker_image = "aosp-builder:mock"
+base_lv_name = "xxx_base_lv"
+base_lv_size_gb = 1
+base_mount_path = "/tmp/aosp_workspaces/xxx/base_mount"
+
+[base_projects.build_config]
+setup_commands = ["source build/envsetup.sh", "lunch mock_target-eng"]
+compile_command = "m -j$(nproc)"
+
+[base_projects.build_config.env_vars]
+USE_CCACHE = "1"
