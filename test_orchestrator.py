@@ -36,6 +36,7 @@ from storage import (
     umount,
     docker_rm,
 )
+from main import get_base_project
 
 
 def run_cli(*args) -> subprocess.CompletedProcess:
@@ -195,34 +196,49 @@ def _reset_config():
 # ── Test Cases ────────────────────────────────────────────────
 
 class TestAssertion1Initialization:
-    """断言 1: 初始化验证"""
+    """断言 1: 初始化验证（link 只写配置，activate 懒加载触发 LVM 操作）"""
 
-    def test_link_creates_pool_image(self):
-        """After link, /aosp_pool.img must exist."""
+    def test_link_writes_config(self):
+        """After link, config.toml must contain the base project."""
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
+        config = read_config()
+        bp = get_base_project(config, "xxx")
+        assert bp is not None, "Base project 'xxx' not found in config after link"
+        assert bp["base_lv_name"] == "xxx_base_lv"
+
+    def test_activate_creates_pool_image(self):
+        """After activate (lazy), /aosp_pool.img must exist."""
+        run_link()
+        run_cli("create", "a", "--base", "xxx")
+        result = run_cli("activate", "a")
+        assert result.returncode == 0, f"activate failed: {result.stderr}"
         assert os.path.exists("/aosp_pool.img"), "Pool image /aosp_pool.img not created"
 
-    def test_link_creates_vg(self):
-        """After link, vgaosp_pool VG must be active."""
-        result = run_link()
-        assert result.returncode == 0, f"link failed: {result.stderr}"
+    def test_activate_creates_vg_and_base_lv_with_mock_output(self):
+        """After activate (lazy), VG must be active and base LV must contain mock_system.img."""
+        run_link()
+        run_cli("create", "a", "--base", "xxx")
+        result = run_cli("activate", "a")
+        assert result.returncode == 0, f"activate failed: {result.stderr}"
+
+        # VG must exist
         assert vg_exists("vgaosp_pool"), "VG vgaosp_pool not active"
 
-    def test_link_creates_base_lv_with_mock_output(self):
-        """After link, base LV must contain mock_system.img."""
-        result = run_link()
-        assert result.returncode == 0, f"link failed: {result.stderr}"
-
-        # Mount base LV to verify contents
+        # Base LV must contain mock content - mount it to verify
         config = read_config()
         vg_name = config["global"]["lvm_vg_name"]
         base_lv_name = config["base_projects"][0]["base_lv_name"]
         base_mount_path = config["base_projects"][0]["base_mount_path"]
 
-        from storage import mount as do_mount
-        os.makedirs(base_mount_path, exist_ok=True)
-        do_mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+        # The base LV may be unmounted after activate (snapshot is mounted instead)
+        # So we need to mount it separately to check
+        if not is_lv_mounted(vg_name, base_lv_name):
+            from storage import activate_lv
+            activate_lv(vg_name, base_lv_name)
+            from storage import mount as do_mount
+            os.makedirs(base_mount_path, exist_ok=True)
+            do_mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
 
         mock_img = os.path.join(base_mount_path, "out", "mock_system.img")
         assert os.path.exists(mock_img), f"mock_system.img not found at {mock_img}"

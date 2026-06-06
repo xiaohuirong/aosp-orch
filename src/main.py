@@ -3,7 +3,6 @@
 import sys
 import os
 import logging
-import tempfile
 
 import click
 import tomlkit
@@ -120,6 +119,68 @@ def ensure_pool_and_vg(config: dict) -> str | None:
     return loop_dev
 
 
+def _ensure_base_lv(config: dict, bp: dict) -> None:
+    """Lazy-init: ensure pool, VG, base LV exist, are formatted, mounted, and populated.
+
+    This is the core lazy-load logic called by activate/sync/compile when they
+    discover the base infrastructure is missing.
+    """
+    g = config["global"]
+    vg_name = g["lvm_vg_name"]
+    thin_pool_name = g["thin_pool_name"]
+    mode = g["mode"]
+    base_lv_name = bp["base_lv_name"]
+    base_mount_path = bp["base_mount_path"]
+    docker_image = bp["docker_image"]
+
+    # 1. Ensure pool and VG
+    ensure_pool_and_vg(config)
+
+    # 2. Create base LV if not exists
+    if not lv_exists(vg_name, base_lv_name):
+        create_thin_lv(vg_name, thin_pool_name, base_lv_name, bp["base_lv_size_gb"])
+        format_ext4(f"/dev/{vg_name}/{base_lv_name}")
+
+    # Ensure base LV is activated
+    activate_lv(vg_name, base_lv_name)
+
+    # 3. Mount base LV if not mounted
+    os.makedirs(base_mount_path, exist_ok=True)
+    if not is_lv_mounted(vg_name, base_lv_name):
+        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+
+    # Fix ownership
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+
+    # 4. Populate if empty (first-time setup)
+    # Check if base LV has content by looking for a marker
+    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+    if not os.path.exists(marker):
+        if mode == "mock":
+            if not docker_image_exists(docker_image):
+                docker_build_mock(docker_image)
+            mock_populate_base(base_mount_path)
+        else:
+            build_config = bp.get("build_config", {})
+            c_name = container_name(bp["name"], "default")
+            if docker_container_exists(c_name):
+                docker_rm(c_name)
+            docker_run(c_name, base_mount_path, f"/{bp['name']}", docker_image)
+            docker_exec(c_name, f"cd /{bp['name']} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
+            docker_exec(c_name, f"cd /{bp['name']} && repo sync")
+            for cmd in build_config.get("setup_commands", []):
+                docker_exec(c_name, f"cd /{bp['name']} && {cmd}")
+            compile_cmd = build_config.get("compile_command", "")
+            env_vars = build_config.get("env_vars", {})
+            env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
+            if compile_cmd:
+                docker_exec(c_name, f"cd /{bp['name']} && {env_str} {compile_cmd}")
+            docker_rm(c_name)
+        # Write marker
+        with open(marker, "w") as f:
+            f.write("initialized")
+
+
 # ── CLI Commands ──────────────────────────────────────────────
 
 @click.group()
@@ -218,7 +279,7 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
 @click.option("--base-mount-path", default=None, help="基底卷挂载路径")
 @click.pass_context
 def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path):
-    """交互式或参数化配置并初始化 base project。"""
+    """交互式或参数化配置 base project（仅写配置，不触发 LVM 操作）。"""
     config_path = ctx.obj["config_path"]
 
     # Load or create config
@@ -301,64 +362,9 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
         bp["base_mount_path"] = click.prompt("基底卷挂载路径", default=bp["base_mount_path"])
 
-    # Save config before proceeding with LVM operations
+    # Save config only — no LVM operations
     save_config(config, config_path)
-
-    # Now perform the actual link operations
-    vg_name = g["lvm_vg_name"]
-    thin_pool_name = g["thin_pool_name"]
-    base_lv_name = bp["base_lv_name"]
-    base_mount_path_val = bp["base_mount_path"]
-    docker_image_val = bp["docker_image"]
-
-    # 1. Ensure pool and VG
-    ensure_pool_and_vg(config)
-
-    # 2. Create base LV if not exists
-    if not lv_exists(vg_name, base_lv_name):
-        create_thin_lv(vg_name, thin_pool_name, base_lv_name, bp["base_lv_size_gb"])
-        format_ext4(f"/dev/{vg_name}/{base_lv_name}")
-
-    # Ensure base LV is activated
-    activate_lv(vg_name, base_lv_name)
-
-    # 3. Mount base LV
-    os.makedirs(base_mount_path_val, exist_ok=True)
-    if not is_lv_mounted(vg_name, base_lv_name):
-        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path_val)
-
-    # Fix ownership: mount via sudo makes root own the mount point
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path_val])
-
-    # 4. Populate based on mode
-    if mode == "mock":
-        # Ensure mock Docker image exists
-        if not docker_image_exists(docker_image_val):
-            docker_build_mock(docker_image_val)
-        mock_populate_base(base_mount_path_val)
-    else:
-        # Prod mode: repo init/sync + compile
-        build_config = bp.get("build_config", {})
-        c_name = container_name(bp_name, "default")
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        docker_run(c_name, base_mount_path_val, f"/{bp_name}", docker_image_val)
-        # repo init & sync
-        docker_exec(c_name, f"cd /{bp_name} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
-        docker_exec(c_name, f"cd /{bp_name} && repo sync")
-        # build
-        for cmd in build_config.get("setup_commands", []):
-            docker_exec(c_name, f"cd /{bp_name} && {cmd}")
-        compile_cmd = build_config.get("compile_command", "")
-        env_vars = build_config.get("env_vars", {})
-        env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
-        if compile_cmd:
-            docker_exec(c_name, f"cd /{bp_name} && {env_str} {compile_cmd}")
-        docker_rm(c_name)
-
-    # 5. Unmount base LV
-    umount(base_mount_path_val)
-    click.echo(f"Base project '{bp_name}' linked successfully.")
+    click.echo(f"Base project '{bp_name}' configured. Run 'activate' to materialize.")
 
 
 @cli.command()
@@ -427,6 +433,13 @@ def activate(ctx, workspace_name):
     mount_path = ws["mount_path"]
     docker_image = bp["docker_image"]
 
+    # Lazy: ensure base LV exists and is populated before creating snapshot
+    _ensure_base_lv(config, bp)
+
+    # Unmount base LV after ensuring it's populated (snapshots are taken from unmounted base)
+    if is_lv_mounted(vg_name, base_lv_name):
+        umount(bp["base_mount_path"])
+
     # 1. Lazy snapshot: create if not exists
     if not lv_exists(vg_name, snapshot_lv_name):
         create_snapshot(vg_name, base_lv_name, snapshot_lv_name)
@@ -434,7 +447,7 @@ def activate(ctx, workspace_name):
     # Ensure snapshot LV is activated (thin snapshots have activation skip flag)
     activate_lv(vg_name, snapshot_lv_name)
 
-    # 2. Mount
+    # 2. Mount snapshot
     os.makedirs(mount_path, exist_ok=True)
     if not is_lv_mounted(vg_name, snapshot_lv_name):
         mount(f"/dev/{vg_name}/{snapshot_lv_name}", mount_path)
@@ -613,16 +626,15 @@ def sync(ctx, base):
     bp["workspaces"].clear()
     save_config(config, config_path)
 
-    # 2. Mount base LV
-    activate_lv(vg_name, base_lv_name)
-    os.makedirs(base_mount_path, exist_ok=True)
-    if not is_lv_mounted(vg_name, base_lv_name):
-        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+    # 2. Ensure base LV exists (lazy)
+    _ensure_base_lv(config, bp)
 
-    # Fix ownership: mount via sudo makes root own the mount point
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+    # 3. Remove initialization marker to force re-populate
+    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+    if os.path.exists(marker):
+        os.remove(marker)
 
-    # 3. Re-sync and re-compile
+    # Re-populate
     if mode == "mock":
         if not docker_image_exists(docker_image):
             docker_build_mock(docker_image)
@@ -643,6 +655,10 @@ def sync(ctx, base):
         if compile_cmd:
             docker_exec(c_name, f"cd /{base} && {env_str} {compile_cmd}")
         docker_rm(c_name)
+
+    # Write marker back
+    with open(marker, "w") as f:
+        f.write("initialized")
 
     # 4. Unmount base LV
     umount(base_mount_path)
