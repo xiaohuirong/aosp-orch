@@ -62,6 +62,65 @@ def load_config(config_path: str) -> dict:
         return tomlkit.load(f)
 
 
+def validate_config(config: dict) -> list[str]:
+    """Validate config structure. Returns list of error messages (empty = valid)."""
+    errors = []
+
+    # [global] section
+    g = config.get("global")
+    if g is None:
+        errors.append("Missing [global] section")
+    else:
+        for key in ("mode", "pool_image_path", "pool_image_size_gb", "lvm_vg_name", "thin_pool_name"):
+            if key not in g:
+                errors.append(f"Missing global.{key}")
+        if "mode" in g and g["mode"] not in ("mock", "prod"):
+            errors.append(f"global.mode must be 'mock' or 'prod', got '{g['mode']}'")
+        if "pool_image_size_gb" in g and not isinstance(g["pool_image_size_gb"], (int, float)) or g.get("pool_image_size_gb", 0) <= 0:
+            errors.append("global.pool_image_size_gb must be a positive number")
+
+    # [[base_projects]]
+    bps = config.get("base_projects")
+    if bps is None:
+        errors.append("Missing [[base_projects]]")
+    elif not isinstance(bps, list):
+        errors.append("base_projects must be an array-of-tables ([[base_projects]])")
+    else:
+        for i, bp in enumerate(bps):
+            prefix = f"base_projects[{i}]" + (f"({bp.get('name', '?')})" if "name" in bp else "")
+            for key in ("name", "repo_url", "repo_branch", "docker_image",
+                        "base_lv_name", "base_lv_size_gb", "base_mount_path"):
+                if key not in bp:
+                    errors.append(f"Missing {prefix}.{key}")
+            if "base_lv_size_gb" in bp and (not isinstance(bp["base_lv_size_gb"], (int, float)) or bp["base_lv_size_gb"] <= 0):
+                errors.append(f"{prefix}.base_lv_size_gb must be a positive number")
+            # Check workspaces structure
+            for j, ws in enumerate(bp.get("workspaces", [])):
+                ws_prefix = f"{prefix}.workspaces[{j}]" + (f"({ws.get('name', '?')})" if "name" in ws else "")
+                for key in ("name", "status", "snapshot_lv_name", "mount_path"):
+                    if key not in ws:
+                        errors.append(f"Missing {ws_prefix}.{key}")
+                if "status" in ws and ws["status"] not in ("active", "inactive"):
+                    errors.append(f"{ws_prefix}.status must be 'active' or 'inactive'")
+
+    return errors
+
+
+def load_and_validate_config(config_path: str) -> dict:
+    """Load config and validate. Exits with error if invalid."""
+    if not os.path.exists(config_path):
+        click.echo(f"配置文件不存在: {config_path}\n请先运行 'init' 或 'link' 命令创建配置。", err=True)
+        sys.exit(1)
+    config = load_config(config_path)
+    errors = validate_config(config)
+    if errors:
+        click.echo(f"配置文件 {config_path} 存在错误:", err=True)
+        for e in errors:
+            click.echo(f"  - {e}", err=True)
+        sys.exit(1)
+    return config
+
+
 def save_config(config: dict, config_path: str) -> None:
     """Atomically save config.toml (write to .tmp then rename)."""
     dir_path = os.path.dirname(config_path)
@@ -374,7 +433,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
 def create(ctx, workspace_name, base):
     """Create a lightweight workspace (metadata only)."""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
+    config = load_and_validate_config(config_path)
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
