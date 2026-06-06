@@ -202,14 +202,41 @@ def _force_cleanup_all():
 
     # Remove ALL LVs in the VG
     if vg_exists(VG_NAME):
+        # First pass: unmount any mounted LVs
+        mount_result = run_cmd(["mount"])
+        if mount_result.returncode == 0:
+            for line in mount_result.stdout.strip().split("\n"):
+                parts = line.split()
+                mount_point = parts[2] if len(parts) > 2 else ""
+                should_umount = False
+                for wd in workdirs:
+                    if wd in line:
+                        should_umount = True
+                        break
+                if (should_umount or f"/dev/mapper/{VG_NAME}-" in line or f"/dev/{VG_NAME}/" in line) and mount_point:
+                    umount(mount_point)
+
+        # Lazy unmount any remaining VG mounts
+        run_cmd(["sudo", "umount", "-l", f"/dev/{VG_NAME}"])
+        dm_result = run_cmd(["sudo", "dmsetup", "ls", "--target", "thin"])
+        if dm_result.returncode == 0 and dm_result.stdout.strip():
+            for line in dm_result.stdout.strip().split("\n"):
+                name = line.split()[0] if line.strip() else ""
+                if name.startswith(f"{VG_NAME}-"):
+                    run_cmd(["sudo", "dmsetup", "remove", "--force", name])
+
+        # Remove all LVs: deactivate then force remove
         lvs_result = run_cmd(["sudo", "lvs", "--noheadings", "-o", "lv_name", VG_NAME])
         if lvs_result.returncode == 0 and lvs_result.stdout.strip():
             lv_names = [name.strip() for name in lvs_result.stdout.strip().split("\n") if name.strip()]
+            # Deactivate all LVs first
+            for lv_name in lv_names:
+                run_cmd(["sudo", "lvchange", "-an", f"/dev/{VG_NAME}/{lv_name}"])
+            # Remove snapshots first, then base LVs, then pool
             for lv_name in sorted(lv_names, key=lambda n: (n == THIN_POOL_NAME, "_snapshot_lv" not in n)):
-                if lv_name != THIN_POOL_NAME:
-                    remove_lv(VG_NAME, lv_name)
-        if lv_exists(VG_NAME, THIN_POOL_NAME):
-            remove_lv(VG_NAME, THIN_POOL_NAME)
+                run_cmd(["sudo", "lvremove", "-ff", "-y", f"/dev/{VG_NAME}/{lv_name}"])
+
+        # Force remove VG and PV
         run_cmd(["sudo", "vgremove", "-ff", "-y", VG_NAME])
 
     # Detach all loop devices associated with any pool image

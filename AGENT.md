@@ -17,7 +17,7 @@ aosp-env/
 ├── src/
 │   ├── main.py           # CLI 入口（Click），所有命令
 │   └── storage.py        # 底层 LVM/Loop/Mount/Docker 操作封装
-└── test_orchestrator.py  # E2E 自动化测试（9 个用例）
+└── test_orchestrator.py  # E2E 自动化测试（11 个用例）
 ```
 
 ---
@@ -197,6 +197,17 @@ workspace 的 active/inactive 状态**不存储在配置文件中**，而是通�
 
 Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lvchange -K -ay` 才能激活，否则 mount 报 `Can't lookup blockdev` 错误。
 
+### Docker 容器持久化
+
+容器使用 `--entrypoint /bin/sh -c "tail -f /dev/null"` 保持后台运行，而非依赖镜像默认 CMD。`docker_exec` 使用 `/bin/sh`（非 `/bin/bash`）以兼容 Alpine 镜像。
+
+### Git 同步模式
+
+`sync_type: git` 时，代码同步到容器内 `/{project_name}/git-repo` 子目录（非挂载点根目录）：
+- **首次**：`git init` + `git remote add` + `git fetch` + `git checkout`
+- **已有 .git**：`git pull`；失败时询问用户是否清除重建
+- **挂载点根目录**保持干净，避免 git clone 到已存在目录的冲突
+
 ### 权限处理
 
 - 所有 LVM/mount 操作通过 `sudo` 执行
@@ -211,7 +222,7 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 - repo: `repo init -u <url> -b <branch>` + `repo sync`
-- git: `git clone -b <branch> <url> <project_name>`
+- git: `git init` + `git remote add origin <url>` + `git fetch` + `git checkout -b <branch> origin/<branch>`
 
 ### sync 不删除配置
 
@@ -222,10 +233,17 @@ base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 ## 七、 测试
 
 ```bash
-python3 -m pytest test_orchestrator.py -v    # 必须输出 9 passed
+python3 -m pytest test_orchestrator.py -v    # 必须输出 11 passed
 ```
 
-### 9 个测试用例
+### 测试架构
+
+测试使用 **pytest `tmp_path` fixture** 为每个测试创建独立的临时配置文件，不同测试使用不同的 workdir（`/tmp/aosp_test_mock` 和 `/tmp/aosp_test_prod`），实现完全隔离。
+
+- Mock 测试：workdir = `/tmp/aosp_test_mock`，项目名 `xxx`，Docker 镜像 `aosp-builder:mock`
+- Prod/Git 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`，sync_type = git
+
+### 11 个测试用例
 
 | 类 | 用例 | 验证内容 |
 |---|---|---|
@@ -238,14 +256,51 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 9 passed
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
+| Git | `test_git_clone_to_git_repo_dir` | git sync 模式下 clone 到 /{project}/git-repo 子目录 |
+| Git | `test_git_pull_on_reactivate` | 重新 activate 时 git pull 而非重新 clone |
 
 ### 测试环境 Mock
 
 - Docker 镜像：`alpine:latest` + bash，命名为 `aosp-builder:mock`
 - Pool 大小：2GB（测试用）
 - Base LV 大小：1GB
-- 工作目录：`/tmp/aosp_workspaces/`
+- Mock 工作目录：`/tmp/aosp_test_mock/`
+- Prod 工作目录：`/tmp/aosp_test_prod/`
 
 ### 测试清理
 
-`_force_cleanup` 通过 `lvs` 发现 VG 中所有 LV（而非仅依赖配置），避免孤儿 LV 阻塞清理。同时通过 VG 设备路径（`/dev/mapper/vgaosp_pool-*`）卸载，捕获非 workdir 下的挂载点。
+`_force_cleanup_all()` 清理策略（每个测试前后自动执行）：
+
+1. **容器清理**：删除所有 `aosp_` 前缀的 Docker 容器
+2. **卸载**：先按 workdir 和 VG 设备路径匹配卸载，再 `umount -l` 懒卸载残留
+3. **dmsetup 强制清理**：`dmsetup remove --force` 清除 device mapper 条目，解决 LV "filesystem in use" 问题
+4. **LV 清理**：先 `lvchange -an` 去激活所有 LV，再 `lvremove -ff -y` 强制删除（快照优先于 base LV）
+5. **VG/PV 清理**：`vgremove -ff -y`
+6. **Loop 设备**：`losetup -d` 解绑
+7. **文件清理**：`sudo rm -rf` 删除 pool image 和 workdir
+
+关键：必须先 `dmsetup remove --force` + `lvchange -an` 再 `lvremove`，否则 base LV 因 "filesystem in use" 无法删除。
+
+---
+
+## 八、 已解决的问题
+
+### 容器启动失败（Alpine 兼容性）
+
+`alpine/git` 镜像无 `/bin/bash`，`docker_exec` 改用 `/bin/sh`。容器持久化改用 `--entrypoint /bin/sh -c "tail -f /dev/null"`。
+
+### git clone 到已存在目录
+
+git clone 目标目录已存在时会失败。解决方案：clone 到 `/{project_name}/git-repo` 子目录而非挂载点根目录。
+
+### workspace 状态不同步
+
+原方案将 `status: active/inactive` 存入配置文件，容易与实际状态不一致。改为通过 `docker_container_exists()` 实时判断，配置文件中 workspace 只保留 `name` 字段。
+
+### 测试清理 "filesystem in use"
+
+`lvremove` 报 "Logical volume contains a filesystem in use"，原因是 device mapper 条目未清除。解决：清理时先 `dmsetup remove --force` 清除 DM 条目，再 `lvchange -an` 去激活，最后 `lvremove -ff -y` 强制删除。
+
+### 测试间 VG 残留
+
+不同测试共享同一个 VG 名 `vgaosp_pool`，若前一个测试清理不彻底会导致 `vgcreate` 报 "already exists"。解决：使用 `tmp_path` fixture 为每个测试创建独立配置，不同测试使用不同 workdir；清理函数覆盖所有 workdir。
