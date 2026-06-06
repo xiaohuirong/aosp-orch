@@ -231,21 +231,20 @@ def docker_run(name: str, mount_path: str, volume_dest: str, image: str, uid: in
     cmd.extend(["-v", f"{mount_path}:{volume_dest}"])
     if uid is not None and gid is not None:
         cmd.extend(["-u", f"{uid}:{gid}"])
+    cmd.extend(["--entrypoint", "/bin/sh"])
     cmd.append(image)
-    cmd.append("tail")
-    cmd.append("-f")
-    cmd.append("/dev/null")
+    cmd.extend(["-c", "tail -f /dev/null"])
     _run(cmd)
     logger.info("Container '%s' started", name)
 
 
-def docker_exec(name: str, command: str, interactive: bool = False) -> subprocess.CompletedProcess:
+def docker_exec(name: str, command: str, interactive: bool = False, check: bool = True) -> subprocess.CompletedProcess:
     """Execute a command in a running container."""
     cmd = ["docker", "exec"]
     if interactive:
         cmd.append("-it")
-    cmd.extend([name, "/bin/bash", "-c", command])
-    return _run(cmd, capture=not interactive)
+    cmd.extend([name, "/bin/sh", "-c", command])
+    return _run(cmd, capture=not interactive, check=check)
 
 
 def docker_rm(name: str) -> None:

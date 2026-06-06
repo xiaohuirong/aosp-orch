@@ -218,7 +218,10 @@ def _run_sync(c_name: str, bp: dict) -> None:
 
     sync_type: "repo" (default) or "git"
     - repo: repo init -u <url> -b <branch> && repo sync
-    - git: git clone -b <branch> <url> <project_name>
+    - git:
+      - if .git exists: git pull
+      - if git pull fails: ask user to clear and re-clone or skip
+      - if .git not exists: git clone -b <branch> <url> <project_name>
     """
     sync_type = bp.get("sync_type", "repo")
     project_dir = bp["name"]
@@ -226,7 +229,22 @@ def _run_sync(c_name: str, bp: dict) -> None:
     repo_branch = bp["repo_branch"]
 
     if sync_type == "git":
-        docker_exec(c_name, f"cd / && git clone -b {repo_branch} {repo_url} {project_dir}")
+        # Git repo lives in /{project_dir}/git-repo, mount point is /{project_dir}
+        git_repo_dir = f"/{project_dir}/git-repo"
+        check = docker_exec(c_name, f"test -d {git_repo_dir}/.git && echo EXISTS || echo MISSING")
+        if "EXISTS" in check.stdout:
+            # Try git pull first
+            result = docker_exec(c_name, f"cd {git_repo_dir} && git pull", check=False)
+            if result.returncode != 0:
+                click.echo(f"git pull 失败: {result.stderr}")
+                if click.confirm("是否清除目录并重新 git clone?", default=True):
+                    docker_exec(c_name, f"rm -rf {git_repo_dir}")
+                    docker_exec(c_name, f"git clone -b {repo_branch} {repo_url} {git_repo_dir}")
+                else:
+                    click.echo("跳过同步，继续后续操作。")
+        else:
+            # Fresh clone
+            docker_exec(c_name, f"git clone -b {repo_branch} {repo_url} {git_repo_dir}")
     else:
         # Default: repo
         docker_exec(c_name, f"cd /{project_dir} && repo init -u {repo_url} -b {repo_branch}")
@@ -609,7 +627,7 @@ def enter(ctx, workspace_name, base):
         ctx.invoke(activate, workspace_name=workspace_name, base=base)
 
     c_name = container_name(bp["name"], workspace_name)
-    os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/bash"])
+    os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
 
 
 @cli.command()
