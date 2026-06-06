@@ -331,15 +331,9 @@ class TestAssertion3DeactivationIdempotency:
         result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
-        # Verify it's active
-        config = read_config()
-        ws = None
-        for bp in config["base_projects"]:
-            for w in bp.get("workspaces", []):
-                if w["name"] == "a":
-                    ws = w
-                    break
-        assert ws is not None and ws["status"] == "active"
+        # Verify it's active (check Docker, not config)
+        assert docker_container_exists("aosp_xxx_a"), \
+            "Container aosp_xxx_a should exist after activate"
 
         # Deactivate
         result = run_cli("deactivate", "a", "--base", "xxx")
@@ -350,19 +344,9 @@ class TestAssertion3DeactivationIdempotency:
         assert "a_snapshot_lv" not in mount_result.stdout, \
             f"a_snapshot_lv still mounted after deactivate"
 
-        # Assert: Docker container must not exist
+        # Assert: Docker container must not exist (inactive)
         assert not docker_container_exists("aosp_xxx_a"), \
             "Container aosp_xxx_a still exists after deactivate"
-
-        # Assert: config status is inactive
-        config = read_config()
-        ws = None
-        for bp in config["base_projects"]:
-            for w in bp.get("workspaces", []):
-                if w["name"] == "a":
-                    ws = w
-                    break
-        assert ws is not None and ws["status"] == "inactive"
 
 
 class TestAssertion4ForceSync:

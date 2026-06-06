@@ -130,11 +130,8 @@ def validate_config(config: dict) -> list[str]:
             # Check workspaces structure
             for j, ws in enumerate(bp.get("workspaces", [])):
                 ws_prefix = f"{prefix}.workspaces[{j}]" + (f"({ws.get('name', '?')})" if "name" in ws else "")
-                for key in ("name", "status"):
-                    if key not in ws:
-                        errors.append(f"Missing {ws_prefix}.{key}")
-                if "status" in ws and ws["status"] not in ("active", "inactive"):
-                    errors.append(f"{ws_prefix}.status must be 'active' or 'inactive'")
+                if "name" not in ws:
+                    errors.append(f"Missing {ws_prefix}.name")
 
     return errors
 
@@ -178,6 +175,11 @@ def get_workspace(base_project: dict, ws_name: str) -> dict | None:
         if ws["name"] == ws_name:
             return ws
     return None
+
+
+def _is_workspace_active(base_project_name: str, ws_name: str) -> bool:
+    """Determine workspace active status from Docker (source of truth)."""
+    return docker_container_exists(container_name(base_project_name, ws_name))
 
 
 def container_name(base_project_name: str, ws_name: str) -> str:
@@ -498,12 +500,11 @@ def create(ctx, workspace_name, base):
 
     new_ws = {
         "name": workspace_name,
-        "status": "inactive",
     }
     bp.setdefault("workspaces", []).append(new_ws)
     save_config(config, config_path)
     mount_path = _workspace_mount_path(config, base, workspace_name)
-    click.echo(f"Workspace '{workspace_name}' created (inactive).")
+    click.echo(f"Workspace '{workspace_name}' created.")
     click.echo(f"  snapshot_lv_name = {_snapshot_lv_name(workspace_name)} (自动生成)")
     click.echo(f"  mount_path        = {mount_path} (自动生成)")
 
@@ -529,12 +530,12 @@ def activate(ctx, workspace_name, base):
     if ws is None:
         # Auto-create workspace if not exists
         click.echo(f"Workspace '{workspace_name}' not found, auto-creating...")
-        ws = {"name": workspace_name, "status": "inactive"}
+        ws = {"name": workspace_name}
         bp.setdefault("workspaces", []).append(ws)
         save_config(config, config_path)
         click.echo(f"Workspace '{workspace_name}' created.")
 
-    if ws["status"] == "active":
+    if _is_workspace_active(base, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already active.")
         return
 
@@ -572,9 +573,6 @@ def activate(ctx, workspace_name, base):
     gid = os.getgid()
     docker_run(c_name, mount_path, f"/{project_name}", docker_image, uid=uid, gid=gid)
 
-    # 4. Update status
-    ws["status"] = "active"
-    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' activated.")
 
 
@@ -600,7 +598,7 @@ def enter(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
-    if ws["status"] != "active":
+    if not _is_workspace_active(base, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is not active, auto-activating...")
         ctx.invoke(activate, workspace_name=workspace_name, base=base)
 
@@ -627,7 +625,7 @@ def deactivate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
-    if ws["status"] == "inactive":
+    if not _is_workspace_active(base, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already inactive.")
         return
 
@@ -642,9 +640,6 @@ def deactivate(ctx, workspace_name, base):
     if is_mounted(mount_path):
         umount(mount_path)
 
-    # 3. Update status
-    ws["status"] = "inactive"
-    save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' deactivated.")
 
 
@@ -675,7 +670,7 @@ def remove(ctx, workspace_name, base):
         sys.exit(1)
 
     # 1. Deactivate if active
-    if ws["status"] == "active":
+    if _is_workspace_active(base, workspace_name):
         c_name = container_name(bp["name"], workspace_name)
         if docker_container_exists(c_name):
             docker_rm(c_name)
