@@ -47,7 +47,8 @@ base_projects:
       compile_command: m -j$(nproc)
       env_vars:
         USE_CCACHE: "1"
-    workspaces: []
+    workspaces:
+      - name: a
 ```
 
 ### 设计原则：配置文件只存用户需要关心的内容
@@ -66,6 +67,8 @@ base_projects:
 | base_mount_path | `{workdir}/{project}/base_mount` | `/tmp/aosp_workspaces/xxx/base_mount` |
 | snapshot_lv_name | `{workspace}_snapshot_lv` | `a_snapshot_lv` |
 | workspace mount | `{workdir}/{project}/{workspace}` | `/tmp/aosp_workspaces/xxx/a` |
+
+**workspace 状态不存配置**：active/inactive 由 `docker_container_exists` 实时判断，配置文件中 workspace 只有 `name` 字段。
 
 ---
 
@@ -104,30 +107,40 @@ python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
 
 ### `create` —— 创建工作区（纯元数据）
 
+在配置文件中添加 workspace 条目（仅 `name` 字段），不触发任何 LVM/Docker 操作。
+
 ```bash
 python3 src/main.py create <workspace_name> --base <project_name>
 ```
 
-### `activate` —— 激活工作区（懒加载）
+### `activate` —— 激活工作区（懒加载 + 自动创建）
 
 触发懒加载：若 base LV 不存在则自动创建池、VG、LV、格式化、填充内容。然后创建快照、挂载、启动容器。
 
+**自动创建**：若 workspace 不存在，询问用户是否创建（默认 Y），确认后自动创建并激活。
+
 ```bash
-python3 src/main.py activate <workspace_name>
+python3 src/main.py activate <workspace_name> --base <project_name>
 ```
 
-### `enter` —— 进入工作区容器
+### `enter` —— 进入工作区容器（自动补充前序步骤）
+
+进入 workspace 容器交互 Shell。自动检查并补充前序步骤：
+
+1. **workspace 不存在** → 询问"是否创建?"（默认 Y）→ 自动 create
+2. **workspace 未激活** → 询问"是否激活?"（默认 Y）→ 自动 activate
+3. 进入容器 `docker exec -it`
 
 ```bash
-python3 src/main.py enter <workspace_name>
+python3 src/main.py enter <workspace_name> --base <project_name>
 ```
 
 ### `deactivate` —— 去激活工作区
 
-停容器、卸载，数据保留在快照卷中。
+停容器、卸载，数据保留在快照卷中。幂等操作（已 inactive 时安全返回）。
 
 ```bash
-python3 src/main.py deactivate <workspace_name>
+python3 src/main.py deactivate <workspace_name> --base <project_name>
 ```
 
 ### `remove` —— 彻底销毁工作区
@@ -135,12 +148,12 @@ python3 src/main.py deactivate <workspace_name>
 去激活 + 销毁快照卷 + 从配置中移除。
 
 ```bash
-python3 src/main.py remove <workspace_name>
+python3 src/main.py remove <workspace_name> --base <project_name>
 ```
 
 ### `sync` —— 基底强制更新（清盘流）
 
-销毁所有子工作区，重新拉取/编译基底。支持 repo/git 两种同步方式。
+销毁所有子工作区的快照卷和容器，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次 activate 时自动重建快照。支持 repo/git 两种同步方式。
 
 ```bash
 python3 src/main.py sync --base <project_name>
@@ -164,6 +177,10 @@ python3 src/main.py compile --base <project_name>
 
 使用 `.aosp_base_initialized` 标记文件判断 base LV 是否已首次填充。
 
+### `_ensure_base_lv` 优化
+
+只在首次填充时挂载 base LV（检查 marker），已填充的情况下跳过 mount/unmount 周期。函数结束后 base LV 保持卸载状态（快照从卸载的 base 创建以确保文件系统一致性）。
+
 ---
 
 ## 六、 关键技术细节
@@ -171,6 +188,10 @@ python3 src/main.py compile --base <project_name>
 ### 硬编码常量与自动推导
 
 LVM 卷组名、精简池名、所有 LV 名和挂载路径均由代码自动推导，不写入配置文件，减轻用户阅读负担。参见第三节"自动推导路径"表。
+
+### workspace 状态判断
+
+workspace 的 active/inactive 状态**不存储在配置文件中**，而是通过 `docker_container_exists(container_name)` 实时判断。容器存在 = active，容器不存在 = inactive。这避免了配置与实际状态不同步的问题。
 
 ### LVM Thin Snapshot 激活
 
@@ -184,13 +205,17 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 ### 配置验证
 
-每个命令执行前应检查配置文件的正确性（`global` 必需字段、`base_projects` 结构等）。
+每个命令执行前应检查配置文件的正确性（`global` 必需字段、`base_projects` 结构等）。workspace 只需 `name` 字段，不再需要 `status`。
 
 ### sync_type 支持
 
 base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 - repo: `repo init -u <url> -b <branch>` + `repo sync`
 - git: `git clone -b <branch> <url> <project_name>`
+
+### sync 不删除配置
+
+`sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次 `activate` 时自动重建快照，无需重新 `create`。
 
 ---
 
@@ -208,8 +233,8 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 9 passed
 | 断言1 | `test_activate_creates_pool_image` | activate 懒加载创建 pool image |
 | 断言1 | `test_activate_creates_vg_and_base_lv_with_mock_output` | activate 懒加载创建 VG + base LV 含 mock 产物 |
 | 断言2 | `test_workspace_isolation` | 工作区 a 写入的文件在 b 中不可见（块设备级物理隔离） |
-| 断言3 | `test_deactivate_unmounts_and_removes_container` | deactivate 后快照已卸载、容器已删除、状态为 inactive |
-| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 重新 activate 后懒加载重建且干净 |
+| 断言3 | `test_deactivate_unmounts_and_removes_container` | deactivate 后快照已卸载、容器已删除 |
+| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 重新 activate 后懒加载重建且干净 |
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
@@ -220,3 +245,7 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 9 passed
 - Pool 大小：2GB（测试用）
 - Base LV 大小：1GB
 - 工作目录：`/tmp/aosp_workspaces/`
+
+### 测试清理
+
+`_force_cleanup` 通过 `lvs` 发现 VG 中所有 LV（而非仅依赖配置），避免孤儿 LV 阻塞清理。同时通过 VG 设备路径（`/dev/mapper/vgaosp_pool-*`）卸载，捕获非 workdir 下的挂载点。
