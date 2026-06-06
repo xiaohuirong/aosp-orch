@@ -513,7 +513,10 @@ def create(ctx, workspace_name, base):
 @click.option("--base", required=True, help="Base project name")
 @click.pass_context
 def activate(ctx, workspace_name, base):
-    """Activate a workspace (lazy snapshot + mount + container)."""
+    """Activate a workspace (lazy snapshot + mount + container).
+
+    Auto-creates the workspace if it doesn't exist yet.
+    """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
@@ -524,8 +527,12 @@ def activate(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
-        sys.exit(1)
+        # Auto-create workspace if not exists
+        click.echo(f"Workspace '{workspace_name}' not found, auto-creating...")
+        ws = {"name": workspace_name, "status": "inactive"}
+        bp.setdefault("workspaces", []).append(ws)
+        save_config(config, config_path)
+        click.echo(f"Workspace '{workspace_name}' created.")
 
     if ws["status"] == "active":
         click.echo(f"Workspace '{workspace_name}' is already active.")
@@ -576,7 +583,10 @@ def activate(ctx, workspace_name, base):
 @click.option("--base", required=True, help="Base project name")
 @click.pass_context
 def enter(ctx, workspace_name, base):
-    """Enter a workspace container interactively."""
+    """Enter a workspace container interactively.
+
+    Auto-activates the workspace if not yet active.
+    """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
@@ -591,8 +601,8 @@ def enter(ctx, workspace_name, base):
         sys.exit(1)
 
     if ws["status"] != "active":
-        click.echo(f"Workspace '{workspace_name}' is not active. Activate it first.", err=True)
-        sys.exit(1)
+        click.echo(f"Workspace '{workspace_name}' is not active, auto-activating...")
+        ctx.invoke(activate, workspace_name=workspace_name, base=base)
 
     c_name = container_name(bp["name"], workspace_name)
     os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/bash"])
