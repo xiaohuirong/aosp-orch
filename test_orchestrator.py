@@ -45,6 +45,21 @@ def run_cli(*args) -> subprocess.CompletedProcess:
     return result
 
 
+def run_link(name="xxx", repo_url="https://github.com/mock/manifest.git",
+             repo_branch="main", docker_image="aosp-builder:mock",
+             base_lv_size_gb=1, base_mount_path="/tmp/aosp_workspaces/xxx/base_mount"):
+    """Run link command with all params (non-interactive)."""
+    return run_cli(
+        "link",
+        "--name", name,
+        "--repo-url", repo_url,
+        "--repo-branch", repo_branch,
+        "--docker-image", docker_image,
+        "--base-lv-size-gb", str(base_lv_size_gb),
+        "--base-mount-path", base_mount_path,
+    )
+
+
 def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
     """Run a system command."""
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -184,19 +199,19 @@ class TestAssertion1Initialization:
 
     def test_link_creates_pool_image(self):
         """After link, /aosp_pool.img must exist."""
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
         assert os.path.exists("/aosp_pool.img"), "Pool image /aosp_pool.img not created"
 
     def test_link_creates_vg(self):
         """After link, vgaosp_pool VG must be active."""
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
         assert vg_exists("vgaosp_pool"), "VG vgaosp_pool not active"
 
     def test_link_creates_base_lv_with_mock_output(self):
         """After link, base LV must contain mock_system.img."""
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Mount base LV to verify contents
@@ -225,7 +240,7 @@ class TestAssertion2SnapshotIsolation:
     def test_workspace_isolation(self):
         """Files in workspace A must not be visible in workspace B."""
         # Step 1: link
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Step 2: create workspace a
@@ -266,7 +281,7 @@ class TestAssertion3DeactivationIdempotency:
     def test_deactivate_unmounts_and_removes_container(self):
         """After deactivate, snapshot LV must be unmounted and container removed."""
         # Setup: link + create + activate
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         result = run_cli("create", "a", "--base", "xxx")
@@ -315,7 +330,7 @@ class TestAssertion4ForceSync:
     def test_sync_destroys_workspaces_and_refreshes_base(self):
         """sync --base must destroy all workspace snapshots and refresh base."""
         # Setup: link + create + activate a and b
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         result = run_cli("create", "a", "--base", "xxx")
@@ -377,7 +392,7 @@ class TestSnapshotSpaceSaving:
     def test_snapshot_data_percent_is_low(self):
         """A freshly created snapshot should have very low data_percent (space saving)."""
         # Setup: link
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Create and activate workspace
@@ -398,7 +413,7 @@ class TestSnapshotSpaceSaving:
     def test_snapshot_only_stores_deltas(self):
         """Writing to a workspace should increase data_percent, but base LV should be unaffected."""
         # Setup: link
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Create and activate workspace
@@ -440,7 +455,7 @@ class TestSnapshotSpaceSaving:
     def test_multiple_snapshots_share_base(self):
         """Multiple workspaces should share the base data, not duplicate it."""
         # Setup: link
-        result = run_cli("link", "--name", "xxx")
+        result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Create and activate two workspaces

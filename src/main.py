@@ -210,74 +210,155 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
 
 
 @cli.command()
-@click.option("--name", required=True, help="Base project name")
+@click.option("--name", default=None, help="Base project 名称")
+@click.option("--repo-url", default=None, help="远程清单仓库地址")
+@click.option("--repo-branch", default=None, help="清单仓库分支")
+@click.option("--docker-image", default=None, help="Docker 镜像名称")
+@click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
+@click.option("--base-mount-path", default=None, help="基底卷挂载路径")
 @click.pass_context
-def link(ctx, name):
-    """Initialize and populate the base LV."""
+def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path):
+    """交互式或参数化配置并初始化 base project。"""
     config_path = ctx.obj["config_path"]
-    config = load_config(config_path)
-    bp = get_base_project(config, name)
-    if bp is None:
-        click.echo(f"Base project '{name}' not found in config", err=True)
-        sys.exit(1)
+
+    # Load or create config
+    if os.path.exists(config_path):
+        config = load_config(config_path)
+    else:
+        config = tomlkit.document()
+        config.setdefault("global", tomlkit.table())
+        g = config["global"]
+        g["version"] = "3.2.0"
+        g["mode"] = "mock"
+        g["pool_image_path"] = "/aosp_pool.img"
+        g["pool_image_size_gb"] = 2
+        g["lvm_vg_name"] = "vgaosp_pool"
+        g["thin_pool_name"] = "aosp_thin_pool"
 
     g = config["global"]
+    mode = g["mode"]
+
+    # Check if all link-specific options are provided
+    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path])
+
+    if all_provided:
+        # Non-interactive: use provided values
+        bp_name = name
+    else:
+        # Interactive mode
+        click.echo("=== 配置 Base Project ===")
+        click.echo("（括号内为当前值/默认值，直接回车保留）\n")
+
+        # List existing projects for reference
+        existing_names = [bp["name"] for bp in config.get("base_projects", [])]
+        if existing_names:
+            click.echo(f"已有项目: {', '.join(existing_names)}")
+
+        bp_name = click.prompt("项目名称", default=name or "aosp")
+
+    # Find or create the base project
+    bp = get_base_project(config, bp_name)
+    if bp is None:
+        # Create new base project entry
+        bp = tomlkit.table()
+        bp["name"] = bp_name
+        bp["repo_url"] = repo_url or "https://android.googlesource.com/platform/manifest"
+        bp["repo_branch"] = repo_branch or "main"
+        bp["docker_image"] = docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest")
+        bp["base_lv_name"] = f"{bp_name}_base_lv"
+        bp["base_lv_size_gb"] = base_lv_size_gb or (1 if mode == "mock" else 100)
+        bp["base_mount_path"] = base_mount_path or f"/tmp/aosp_workspaces/{bp_name}/base_mount"
+
+        build_config = tomlkit.table()
+        build_config["setup_commands"] = ["source build/envsetup.sh", "lunch aosp_x86_64-eng"]
+        build_config["compile_command"] = "m -j$(nproc)"
+        env_vars = tomlkit.table()
+        env_vars["USE_CCACHE"] = "1"
+        build_config["env_vars"] = env_vars
+        bp["build_config"] = build_config
+
+        bp["workspaces"] = tomlkit.aot()
+
+        config.setdefault("base_projects", []).append(bp)
+    else:
+        # Update existing base project with any provided values
+        if repo_url is not None:
+            bp["repo_url"] = repo_url
+        if repo_branch is not None:
+            bp["repo_branch"] = repo_branch
+        if docker_image is not None:
+            bp["docker_image"] = docker_image
+        if base_lv_size_gb is not None:
+            bp["base_lv_size_gb"] = base_lv_size_gb
+        if base_mount_path is not None:
+            bp["base_mount_path"] = base_mount_path
+
+    if not all_provided:
+        # Interactive: let user review/edit key fields
+        bp["repo_url"] = click.prompt("清单仓库地址", default=bp["repo_url"])
+        bp["repo_branch"] = click.prompt("清单分支", default=bp["repo_branch"])
+        bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
+        bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
+        bp["base_mount_path"] = click.prompt("基底卷挂载路径", default=bp["base_mount_path"])
+
+    # Save config before proceeding with LVM operations
+    save_config(config, config_path)
+
+    # Now perform the actual link operations
     vg_name = g["lvm_vg_name"]
     thin_pool_name = g["thin_pool_name"]
-    mode = g["mode"]
     base_lv_name = bp["base_lv_name"]
-    base_lv_size_gb = bp["base_lv_size_gb"]
-    base_mount_path = bp["base_mount_path"]
-    docker_image = bp["docker_image"]
+    base_mount_path_val = bp["base_mount_path"]
+    docker_image_val = bp["docker_image"]
 
     # 1. Ensure pool and VG
     ensure_pool_and_vg(config)
 
     # 2. Create base LV if not exists
     if not lv_exists(vg_name, base_lv_name):
-        create_thin_lv(vg_name, thin_pool_name, base_lv_name, base_lv_size_gb)
+        create_thin_lv(vg_name, thin_pool_name, base_lv_name, bp["base_lv_size_gb"])
         format_ext4(f"/dev/{vg_name}/{base_lv_name}")
 
     # Ensure base LV is activated
     activate_lv(vg_name, base_lv_name)
 
     # 3. Mount base LV
-    os.makedirs(base_mount_path, exist_ok=True)
+    os.makedirs(base_mount_path_val, exist_ok=True)
     if not is_lv_mounted(vg_name, base_lv_name):
-        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path_val)
 
     # Fix ownership: mount via sudo makes root own the mount point
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path_val])
 
     # 4. Populate based on mode
     if mode == "mock":
         # Ensure mock Docker image exists
-        if not docker_image_exists(docker_image):
-            docker_build_mock(docker_image)
-        mock_populate_base(base_mount_path)
+        if not docker_image_exists(docker_image_val):
+            docker_build_mock(docker_image_val)
+        mock_populate_base(base_mount_path_val)
     else:
         # Prod mode: repo init/sync + compile
         build_config = bp.get("build_config", {})
-        c_name = container_name(name, "default")
+        c_name = container_name(bp_name, "default")
         if docker_container_exists(c_name):
             docker_rm(c_name)
-        docker_run(c_name, base_mount_path, f"/{name}", docker_image)
+        docker_run(c_name, base_mount_path_val, f"/{bp_name}", docker_image_val)
         # repo init & sync
-        docker_exec(c_name, f"cd /{name} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
-        docker_exec(c_name, f"cd /{name} && repo sync")
+        docker_exec(c_name, f"cd /{bp_name} && repo init -u {bp['repo_url']} -b {bp['repo_branch']}")
+        docker_exec(c_name, f"cd /{bp_name} && repo sync")
         # build
         for cmd in build_config.get("setup_commands", []):
-            docker_exec(c_name, f"cd /{name} && {cmd}")
+            docker_exec(c_name, f"cd /{bp_name} && {cmd}")
         compile_cmd = build_config.get("compile_command", "")
         env_vars = build_config.get("env_vars", {})
         env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
         if compile_cmd:
-            docker_exec(c_name, f"cd /{name} && {env_str} {compile_cmd}")
+            docker_exec(c_name, f"cd /{bp_name} && {env_str} {compile_cmd}")
         docker_rm(c_name)
 
     # 5. Unmount base LV
-    umount(base_mount_path)
-    click.echo(f"Base project '{name}' linked successfully.")
+    umount(base_mount_path_val)
+    click.echo(f"Base project '{bp_name}' linked successfully.")
 
 
 @cli.command()
