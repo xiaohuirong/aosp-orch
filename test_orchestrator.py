@@ -18,7 +18,7 @@ import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.toml")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
 
 # Add src to path for direct imports
 import sys
@@ -77,17 +77,17 @@ def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
 
 def read_config():
     """Read current config."""
-    import tomlkit
+    import yaml
     with open(CONFIG_PATH, "r") as f:
-        return tomlkit.load(f)
+        return yaml.safe_load(f)
 
 
 def write_config(config):
     """Write config atomically."""
-    import tomlkit
+    import yaml
     tmp_path = CONFIG_PATH + ".test.tmp"
     with open(tmp_path, "w") as f:
-        tomlkit.dump(config, f)
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     os.rename(tmp_path, CONFIG_PATH)
 
 
@@ -168,35 +168,32 @@ def _force_cleanup():
 
 
 def _reset_config():
-    """Reset config.toml to initial test state."""
-    import tomlkit
-    config = tomlkit.document()
-
-    g = tomlkit.table()
-    g["mode"] = "mock"
-    g["workdir"] = "/tmp/aosp_workspaces"
-    g["pool_image_size_gb"] = 2
-    config["global"] = g
-
-    bp = tomlkit.table()
-    bp["name"] = "xxx"
-    bp["repo_url"] = "https://github.com/mock/manifest.git"
-    bp["repo_branch"] = "main"
-    bp["docker_image"] = "aosp-builder:mock"
-    bp["base_lv_size_gb"] = 1
-
-    build_config = tomlkit.table()
-    build_config["setup_commands"] = [
-        "source build/envsetup.sh",
-        "lunch mock_target-eng",
-    ]
-    build_config["compile_command"] = "m -j$(nproc)"
-    build_config["env_vars"] = {"USE_CCACHE": "1"}
-    bp["build_config"] = build_config
-
-    bp["workspaces"] = tomlkit.aot()
-    config["base_projects"] = [bp]
-
+    """Reset config.yaml to initial test state."""
+    config = {
+        "global": {
+            "mode": "mock",
+            "workdir": "/tmp/aosp_workspaces",
+            "pool_image_size_gb": 2,
+        },
+        "base_projects": [
+            {
+                "name": "xxx",
+                "repo_url": "https://github.com/mock/manifest.git",
+                "repo_branch": "main",
+                "docker_image": "aosp-builder:mock",
+                "base_lv_size_gb": 1,
+                "build_config": {
+                    "setup_commands": [
+                        "source build/envsetup.sh",
+                        "lunch mock_target-eng",
+                    ],
+                    "compile_command": "m -j$(nproc)",
+                    "env_vars": {"USE_CCACHE": "1"},
+                },
+                "workspaces": [],
+            },
+        ],
+    }
     write_config(config)
 
 
@@ -206,7 +203,7 @@ class TestAssertion1Initialization:
     """断言 1: 初始化验证（link 只写配置，activate 懒加载触发 LVM 操作）"""
 
     def test_link_writes_config(self):
-        """After link, config.toml must contain the base project with correct TOML format."""
+        """After link, config must contain the base project."""
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
         config = read_config()
@@ -216,14 +213,8 @@ class TestAssertion1Initialization:
         # Verify auto-derived names
         assert _base_lv_name("xxx") == "xxx_base_lv"
 
-        # Verify TOML format: [[base_projects]] array with nested sub-tables
-        raw = open(CONFIG_PATH, "r").read()
-        assert "[[base_projects]]" in raw, "TOML must use [[base_projects]] array-of-tables syntax"
-        assert "[base_projects.build_config]" in raw, "TOML must have [base_projects.build_config] sub-table"
-        assert "[base_projects.build_config.env_vars]" in raw, "TOML must have [base_projects.build_config.env_vars] sub-table"
-        # Ensure no broken top-level tables leaked from the array
-        assert not raw.startswith("base_projects = ["), "TOML must not use inline array syntax for base_projects"
         # Ensure auto-derived fields are NOT stored in config
+        raw = open(CONFIG_PATH, "r").read()
         assert "base_lv_name" not in raw, "base_lv_name should be auto-derived, not stored in config"
         assert "base_mount_path" not in raw, "base_mount_path should be auto-derived, not stored in config"
         assert "lvm_vg_name" not in raw, "lvm_vg_name should be hardcoded, not stored in config"

@@ -5,7 +5,7 @@ import os
 import logging
 
 import click
-import tomlkit
+import yaml
 
 # Ensure src is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "aosp-orch")
-DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.toml")
+DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yaml")
 
 # Hardcoded constants - not configurable to prevent accidental changes
 VG_NAME = "vgaosp_pool"
@@ -83,7 +83,7 @@ def _workspace_mount_path(config: dict, project_name: str, workspace_name: str) 
 # ── Config helpers ───────────────────────────────────────────
 
 def _resolve_config_path() -> str:
-    """Resolve config path: env var > default ~/.config/aosp-orch/config.toml."""
+    """Resolve config path: env var > default ~/.config/aosp-orch/config.yaml."""
     env_path = os.environ.get("AOSP_ORCH_CONFIG")
     if env_path:
         return env_path
@@ -91,9 +91,9 @@ def _resolve_config_path() -> str:
 
 
 def load_config(config_path: str) -> dict:
-    """Load config.toml from the given path."""
+    """Load config.yaml from the given path."""
     with open(config_path, "r") as f:
-        return tomlkit.load(f)
+        return yaml.safe_load(f)
 
 
 def validate_config(config: dict) -> list[str]:
@@ -103,7 +103,7 @@ def validate_config(config: dict) -> list[str]:
     # [global] section
     g = config.get("global")
     if g is None:
-        errors.append("Missing [global] section")
+        errors.append("Missing 'global' section")
     else:
         for key in ("mode", "workdir", "pool_image_size_gb"):
             if key not in g:
@@ -113,12 +113,12 @@ def validate_config(config: dict) -> list[str]:
         if "pool_image_size_gb" in g and not isinstance(g["pool_image_size_gb"], (int, float)) or g.get("pool_image_size_gb", 0) <= 0:
             errors.append("global.pool_image_size_gb must be a positive number")
 
-    # [[base_projects]]
+    # base_projects
     bps = config.get("base_projects")
     if bps is None:
-        errors.append("Missing [[base_projects]]")
+        errors.append("Missing 'base_projects'")
     elif not isinstance(bps, list):
-        errors.append("base_projects must be an array-of-tables ([[base_projects]])")
+        errors.append("base_projects must be a list")
     else:
         for i, bp in enumerate(bps):
             prefix = f"base_projects[{i}]" + (f"({bp.get('name', '?')})" if "name" in bp else "")
@@ -155,12 +155,12 @@ def load_and_validate_config(config_path: str) -> dict:
 
 
 def save_config(config: dict, config_path: str) -> None:
-    """Atomically save config.toml (write to .tmp then rename)."""
+    """Atomically save config.yaml (write to .tmp then rename)."""
     dir_path = os.path.dirname(config_path)
     os.makedirs(dir_path, exist_ok=True)
-    tmp_path = os.path.join(dir_path, ".config.toml.tmp")
+    tmp_path = os.path.join(dir_path, ".config.yaml.tmp")
     with open(tmp_path, "w") as f:
-        tomlkit.dump(config, f)
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     os.rename(tmp_path, config_path)
 
 
@@ -311,16 +311,16 @@ def cli(ctx, config_path):
 @click.option("--pool-image-size-gb", type=int, default=None, help="存储池大小 (GB)")
 @click.pass_context
 def init(ctx, mode, workdir, pool_image_size_gb):
-    """交互式或参数化初始化 config.toml 中的 [global] 配置。"""
+    """交互式或参数化初始化配置文件中的 global 配置。"""
     config_path = ctx.obj["config_path"]
 
     # Load existing config or create new one
     if os.path.exists(config_path):
         config = load_config(config_path)
     else:
-        config = tomlkit.document()
+        config = {}
 
-    g = config.setdefault("global", tomlkit.table())
+    g = config.setdefault("global", {})
 
     # Current defaults
     defaults = {
@@ -353,7 +353,7 @@ def init(ctx, mode, workdir, pool_image_size_gb):
         g["pool_image_size_gb"] = click.prompt("存储池大小 (GB)", type=int, default=pool_size_default)
 
     # Ensure base_projects exists
-    config.setdefault("base_projects", tomlkit.aot())
+    config.setdefault("base_projects", [])
 
     save_config(config, config_path)
     click.echo(f"\n配置已保存到 {config_path}")
@@ -382,12 +382,14 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
     if os.path.exists(config_path):
         config = load_config(config_path)
     else:
-        config = tomlkit.document()
-        config.setdefault("global", tomlkit.table())
-        g = config["global"]
-        g["mode"] = "mock"
-        g["workdir"] = os.path.join(os.path.expanduser("~"), "aosp-workspace")
-        g["pool_image_size_gb"] = 2
+        config = {
+            "global": {
+                "mode": "mock",
+                "workdir": os.path.join(os.path.expanduser("~"), "aosp-workspace"),
+                "pool_image_size_gb": 2,
+            },
+            "base_projects": [],
+        }
 
     g = config["global"]
     mode = g["mode"]
@@ -414,25 +416,21 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
     bp = get_base_project(config, bp_name)
     if bp is None:
         # Create new base project entry
-        bp = tomlkit.table()
-        bp["name"] = bp_name
-        bp["repo_url"] = repo_url or "https://android.googlesource.com/platform/manifest"
-        bp["repo_branch"] = repo_branch or "main"
-        bp["sync_type"] = sync_type or "repo"
-        bp["docker_image"] = docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest")
-        bp["base_lv_size_gb"] = base_lv_size_gb or (1 if mode == "mock" else 100)
-
-        build_config = tomlkit.table()
-        build_config["setup_commands"] = ["source build/envsetup.sh", "lunch aosp_x86_64-eng"]
-        build_config["compile_command"] = "m -j$(nproc)"
-        env_vars = tomlkit.table()
-        env_vars["USE_CCACHE"] = "1"
-        build_config["env_vars"] = env_vars
-        bp["build_config"] = build_config
-
-        bp["workspaces"] = tomlkit.aot()
-
-        config.setdefault("base_projects", tomlkit.aot()).append(bp)
+        bp = {
+            "name": bp_name,
+            "repo_url": repo_url or "https://android.googlesource.com/platform/manifest",
+            "repo_branch": repo_branch or "main",
+            "sync_type": sync_type or "repo",
+            "docker_image": docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest"),
+            "base_lv_size_gb": base_lv_size_gb or (1 if mode == "mock" else 100),
+            "build_config": {
+                "setup_commands": ["source build/envsetup.sh", "lunch aosp_x86_64-eng"],
+                "compile_command": "m -j$(nproc)",
+                "env_vars": {"USE_CCACHE": "1"},
+            },
+            "workspaces": [],
+        }
+        config.setdefault("base_projects", []).append(bp)
     else:
         # Update existing base project with any provided values
         if repo_url is not None:
