@@ -47,6 +47,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "aosp-orch")
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.toml")
 
+# Hardcoded constants - not configurable to prevent accidental changes
+VG_NAME = "vgaosp_pool"
+THIN_POOL_NAME = "aosp_thin_pool"
+POOL_IMAGE_FILENAME = "aosp_pool.img"
+
+
+# ── Path derivation helpers ──────────────────────────────────
+
+def _pool_image_path(config: dict) -> str:
+    """Derive pool image path from workdir."""
+    return os.path.join(config["global"]["workdir"], POOL_IMAGE_FILENAME)
+
+
+def _base_lv_name(project_name: str) -> str:
+    """Generate base LV name from project name."""
+    return f"{project_name}_base_lv"
+
+
+def _base_mount_path(config: dict, project_name: str) -> str:
+    """Generate base mount path from workdir + project name."""
+    return os.path.join(config["global"]["workdir"], project_name, "base_mount")
+
+
+def _snapshot_lv_name(workspace_name: str) -> str:
+    """Generate snapshot LV name from workspace name."""
+    return f"{workspace_name}_snapshot_lv"
+
+
+def _workspace_mount_path(config: dict, project_name: str, workspace_name: str) -> str:
+    """Generate workspace mount path from workdir + project + workspace."""
+    return os.path.join(config["global"]["workdir"], project_name, workspace_name)
+
+
+# ── Config helpers ───────────────────────────────────────────
 
 def _resolve_config_path() -> str:
     """Resolve config path: env var > default ~/.config/aosp-orch/config.toml."""
@@ -71,7 +105,7 @@ def validate_config(config: dict) -> list[str]:
     if g is None:
         errors.append("Missing [global] section")
     else:
-        for key in ("mode", "pool_image_path", "pool_image_size_gb", "lvm_vg_name", "thin_pool_name"):
+        for key in ("mode", "workdir", "pool_image_size_gb"):
             if key not in g:
                 errors.append(f"Missing global.{key}")
         if "mode" in g and g["mode"] not in ("mock", "prod"):
@@ -88,8 +122,7 @@ def validate_config(config: dict) -> list[str]:
     else:
         for i, bp in enumerate(bps):
             prefix = f"base_projects[{i}]" + (f"({bp.get('name', '?')})" if "name" in bp else "")
-            for key in ("name", "repo_url", "repo_branch", "docker_image",
-                        "base_lv_name", "base_lv_size_gb", "base_mount_path"):
+            for key in ("name", "repo_url", "repo_branch", "docker_image", "base_lv_size_gb"):
                 if key not in bp:
                     errors.append(f"Missing {prefix}.{key}")
             if "base_lv_size_gb" in bp and (not isinstance(bp["base_lv_size_gb"], (int, float)) or bp["base_lv_size_gb"] <= 0):
@@ -97,7 +130,7 @@ def validate_config(config: dict) -> list[str]:
             # Check workspaces structure
             for j, ws in enumerate(bp.get("workspaces", [])):
                 ws_prefix = f"{prefix}.workspaces[{j}]" + (f"({ws.get('name', '?')})" if "name" in ws else "")
-                for key in ("name", "status", "snapshot_lv_name", "mount_path"):
+                for key in ("name", "status"):
                     if key not in ws:
                         errors.append(f"Missing {ws_prefix}.{key}")
                 if "status" in ws and ws["status"] not in ("active", "inactive"):
@@ -152,16 +185,15 @@ def container_name(base_project_name: str, ws_name: str) -> str:
     return f"aosp_{base_project_name}_{ws_name}"
 
 
+# ── LVM / Pool helpers ───────────────────────────────────────
+
 def ensure_pool_and_vg(config: dict) -> str | None:
     """Ensure the LVM pool and VG exist. Returns loop device path or None if already set up."""
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
-    pool_image_path = g["pool_image_path"]
-    thin_pool_name = g["thin_pool_name"]
-    pool_size_gb = g["pool_image_size_gb"]
+    pool_image_path = _pool_image_path(config)
+    pool_size_gb = config["global"]["pool_image_size_gb"]
 
-    if vg_exists(vg_name):
-        logger.info("VG '%s' already exists", vg_name)
+    if vg_exists(VG_NAME):
+        logger.info("VG '%s' already exists", VG_NAME)
         return None
 
     # Create pool image
@@ -174,7 +206,7 @@ def ensure_pool_and_vg(config: dict) -> str | None:
         loop_dev = setup_loop_device(pool_image_path)
 
     # Initialize LVM thin pool
-    init_lvm_thin_pool(loop_dev, vg_name, thin_pool_name)
+    init_lvm_thin_pool(loop_dev, VG_NAME, THIN_POOL_NAME)
     return loop_dev
 
 
@@ -204,35 +236,32 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
     This is the core lazy-load logic called by activate/sync/compile when they
     discover the base infrastructure is missing.
     """
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
-    thin_pool_name = g["thin_pool_name"]
-    mode = g["mode"]
-    base_lv_name = bp["base_lv_name"]
-    base_mount_path = bp["base_mount_path"]
+    mode = config["global"]["mode"]
+    project_name = bp["name"]
+    base_lv_name = _base_lv_name(project_name)
+    base_mount_path = _base_mount_path(config, project_name)
     docker_image = bp["docker_image"]
 
     # 1. Ensure pool and VG
     ensure_pool_and_vg(config)
 
     # 2. Create base LV if not exists
-    if not lv_exists(vg_name, base_lv_name):
-        create_thin_lv(vg_name, thin_pool_name, base_lv_name, bp["base_lv_size_gb"])
-        format_ext4(f"/dev/{vg_name}/{base_lv_name}")
+    if not lv_exists(VG_NAME, base_lv_name):
+        create_thin_lv(VG_NAME, THIN_POOL_NAME, base_lv_name, bp["base_lv_size_gb"])
+        format_ext4(f"/dev/{VG_NAME}/{base_lv_name}")
 
     # Ensure base LV is activated
-    activate_lv(vg_name, base_lv_name)
+    activate_lv(VG_NAME, base_lv_name)
 
     # 3. Mount base LV if not mounted
     os.makedirs(base_mount_path, exist_ok=True)
-    if not is_lv_mounted(vg_name, base_lv_name):
-        mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+    if not is_lv_mounted(VG_NAME, base_lv_name):
+        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
 
     # Fix ownership
     _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
 
     # 4. Populate if empty (first-time setup)
-    # Check if base LV has content by looking for a marker
     marker = os.path.join(base_mount_path, ".aosp_base_initialized")
     if not os.path.exists(marker):
         if mode == "mock":
@@ -241,18 +270,18 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
             mock_populate_base(base_mount_path)
         else:
             build_config = bp.get("build_config", {})
-            c_name = container_name(bp["name"], "default")
+            c_name = container_name(project_name, "default")
             if docker_container_exists(c_name):
                 docker_rm(c_name)
-            docker_run(c_name, base_mount_path, f"/{bp['name']}", docker_image)
+            docker_run(c_name, base_mount_path, f"/{project_name}", docker_image)
             _run_sync(c_name, bp)
             for cmd in build_config.get("setup_commands", []):
-                docker_exec(c_name, f"cd /{bp['name']} && {cmd}")
+                docker_exec(c_name, f"cd /{project_name} && {cmd}")
             compile_cmd = build_config.get("compile_command", "")
             env_vars = build_config.get("env_vars", {})
             env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
             if compile_cmd:
-                docker_exec(c_name, f"cd /{bp['name']} && {env_str} {compile_cmd}")
+                docker_exec(c_name, f"cd /{project_name} && {env_str} {compile_cmd}")
             docker_rm(c_name)
         # Write marker
         with open(marker, "w") as f:
@@ -278,12 +307,10 @@ def cli(ctx, config_path):
 @cli.command()
 @click.option("--mode", type=click.Choice(["mock", "prod"]), default=None,
               help="运行模式: mock (测试) | prod (生产)")
-@click.option("--pool-image-path", default=None, help="LVM-on-File 镜像物理路径")
+@click.option("--workdir", default=None, help="工作目录 (所有数据存放根)")
 @click.option("--pool-image-size-gb", type=int, default=None, help="存储池大小 (GB)")
-@click.option("--lvm-vg-name", default=None, help="虚拟卷组名称")
-@click.option("--thin-pool-name", default=None, help="LVM精简配置池名称")
 @click.pass_context
-def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name):
+def init(ctx, mode, workdir, pool_image_size_gb):
     """交互式或参数化初始化 config.toml 中的 [global] 配置。"""
     config_path = ctx.obj["config_path"]
 
@@ -297,44 +324,33 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
 
     # Current defaults
     defaults = {
-        "version": g.get("version", "3.2.0"),
         "mode": g.get("mode", "mock"),
-        "pool_image_path": g.get("pool_image_path", "/aosp_pool.img"),
+        "workdir": g.get("workdir", os.path.join(os.path.expanduser("~"), "aosp-workspace")),
         "pool_image_size_gb": g.get("pool_image_size_gb", 10 if mode == "prod" else 2),
-        "lvm_vg_name": g.get("lvm_vg_name", "vgaosp_pool"),
-        "thin_pool_name": g.get("thin_pool_name", "aosp_thin_pool"),
     }
 
     # If all options provided via CLI args, use them directly (non-interactive)
-    all_provided = all(v is not None for v in [mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_name])
+    all_provided = all(v is not None for v in [mode, workdir, pool_image_size_gb])
 
     if all_provided:
-        g["version"] = defaults["version"]
         g["mode"] = mode
-        g["pool_image_path"] = pool_image_path
+        g["workdir"] = os.path.abspath(workdir)
         g["pool_image_size_gb"] = pool_image_size_gb
-        g["lvm_vg_name"] = lvm_vg_name
-        g["thin_pool_name"] = thin_pool_name
     else:
         # Interactive mode
         click.echo("=== 初始化 AOSP 编排器全局配置 ===")
         click.echo(f"配置文件: {config_path}")
         click.echo("（括号内为当前值/默认值，直接回车保留）\n")
 
-        g["version"] = defaults["version"]
-
         g["mode"] = click.prompt("运行模式 (mock/prod)", default=defaults["mode"])
 
         effective_mode = g["mode"]
         size_default = 400 if effective_mode == "prod" else 2
 
-        g["pool_image_path"] = click.prompt("存储池镜像路径", default=defaults["pool_image_path"])
+        g["workdir"] = os.path.abspath(click.prompt("工作目录", default=defaults["workdir"]))
 
         pool_size_default = pool_image_size_gb if pool_image_size_gb is not None else size_default
         g["pool_image_size_gb"] = click.prompt("存储池大小 (GB)", type=int, default=pool_size_default)
-
-        g["lvm_vg_name"] = click.prompt("LVM 卷组名称", default=lvm_vg_name or defaults["lvm_vg_name"])
-        g["thin_pool_name"] = click.prompt("精简池名称", default=thin_pool_name or defaults["thin_pool_name"])
 
     # Ensure base_projects exists
     config.setdefault("base_projects", tomlkit.aot())
@@ -342,10 +358,11 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
     save_config(config, config_path)
     click.echo(f"\n配置已保存到 {config_path}")
     click.echo("  mode            = %s" % g["mode"])
-    click.echo("  pool_image_path = %s" % g["pool_image_path"])
+    click.echo("  workdir         = %s" % g["workdir"])
+    click.echo("  pool_image      = %s" % _pool_image_path(config))
     click.echo("  pool_image_size = %d GB" % g["pool_image_size_gb"])
-    click.echo("  lvm_vg_name     = %s" % g["lvm_vg_name"])
-    click.echo("  thin_pool_name  = %s" % g["thin_pool_name"])
+    click.echo(f"  lvm_vg_name     = {VG_NAME} (硬编码)")
+    click.echo(f"  thin_pool_name  = {THIN_POOL_NAME} (硬编码)")
 
 
 @cli.command()
@@ -354,11 +371,10 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
 @click.option("--repo-branch", default=None, help="清单仓库分支")
 @click.option("--docker-image", default=None, help="Docker 镜像名称")
 @click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
-@click.option("--base-mount-path", default=None, help="基底卷挂载路径")
 @click.option("--sync-type", type=click.Choice(["repo", "git"]), default=None,
               help="代码同步方式: repo (默认) | git")
 @click.pass_context
-def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path, sync_type):
+def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type):
     """交互式或参数化配置 base project（仅写配置，不触发 LVM 操作）。"""
     config_path = ctx.obj["config_path"]
 
@@ -369,18 +385,15 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         config = tomlkit.document()
         config.setdefault("global", tomlkit.table())
         g = config["global"]
-        g["version"] = "3.2.0"
         g["mode"] = "mock"
-        g["pool_image_path"] = "/aosp_pool.img"
+        g["workdir"] = os.path.join(os.path.expanduser("~"), "aosp-workspace")
         g["pool_image_size_gb"] = 2
-        g["lvm_vg_name"] = "vgaosp_pool"
-        g["thin_pool_name"] = "aosp_thin_pool"
 
     g = config["global"]
     mode = g["mode"]
 
     # Check if all link-specific options are provided
-    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_mount_path, sync_type])
+    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type])
 
     if all_provided:
         # Non-interactive: use provided values
@@ -407,9 +420,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         bp["repo_branch"] = repo_branch or "main"
         bp["sync_type"] = sync_type or "repo"
         bp["docker_image"] = docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest")
-        bp["base_lv_name"] = f"{bp_name}_base_lv"
         bp["base_lv_size_gb"] = base_lv_size_gb or (1 if mode == "mock" else 100)
-        bp["base_mount_path"] = base_mount_path or f"/tmp/aosp_workspaces/{bp_name}/base_mount"
 
         build_config = tomlkit.table()
         build_config["setup_commands"] = ["source build/envsetup.sh", "lunch aosp_x86_64-eng"]
@@ -434,8 +445,6 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
             bp["docker_image"] = docker_image
         if base_lv_size_gb is not None:
             bp["base_lv_size_gb"] = base_lv_size_gb
-        if base_mount_path is not None:
-            bp["base_mount_path"] = base_mount_path
 
     if not all_provided:
         # Interactive: let user review/edit key fields
@@ -445,11 +454,14 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
         bp["sync_type"] = click.prompt("同步方式 (repo/git)", default=bp["sync_type"])
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
-        bp["base_mount_path"] = click.prompt("基底卷挂载路径", default=bp["base_mount_path"])
 
     # Save config only — no LVM operations
     save_config(config, config_path)
-    click.echo(f"Base project '{bp_name}' configured. Run 'activate' to materialize.")
+    # Show auto-derived paths
+    click.echo(f"Base project '{bp_name}' configured.")
+    click.echo(f"  base_lv_name    = {_base_lv_name(bp_name)} (自动生成)")
+    click.echo(f"  base_mount_path = {_base_mount_path(config, bp_name)} (自动生成)")
+    click.echo("Run 'activate' to materialize.")
 
 
 @cli.command()
@@ -469,20 +481,16 @@ def create(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' already exists in '{base}'", err=True)
         sys.exit(1)
 
-    mount_path = os.path.join(
-        os.path.dirname(bp["base_mount_path"]),
-        workspace_name,
-    )
-
     new_ws = {
         "name": workspace_name,
         "status": "inactive",
-        "snapshot_lv_name": f"{workspace_name}_snapshot_lv",
-        "mount_path": mount_path,
     }
     bp.setdefault("workspaces", []).append(new_ws)
     save_config(config, config_path)
+    mount_path = _workspace_mount_path(config, base, workspace_name)
     click.echo(f"Workspace '{workspace_name}' created (inactive).")
+    click.echo(f"  snapshot_lv_name = {_snapshot_lv_name(workspace_name)} (自动生成)")
+    click.echo(f"  mount_path        = {mount_path} (自动生成)")
 
 
 @cli.command()
@@ -492,8 +500,6 @@ def activate(ctx, workspace_name):
     """Activate a workspace (lazy snapshot + mount + container)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
 
     # Find the workspace across all base projects
     bp = None
@@ -513,40 +519,41 @@ def activate(ctx, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already active.")
         return
 
-    base_lv_name = bp["base_lv_name"]
-    snapshot_lv_name = ws["snapshot_lv_name"]
-    mount_path = ws["mount_path"]
+    project_name = bp["name"]
+    base_lv_name = _base_lv_name(project_name)
+    snapshot_lv_name = _snapshot_lv_name(workspace_name)
+    mount_path = _workspace_mount_path(config, project_name, workspace_name)
     docker_image = bp["docker_image"]
 
     # Lazy: ensure base LV exists and is populated before creating snapshot
     _ensure_base_lv(config, bp)
 
     # Unmount base LV after ensuring it's populated (snapshots are taken from unmounted base)
-    if is_lv_mounted(vg_name, base_lv_name):
-        umount(bp["base_mount_path"])
+    if is_lv_mounted(VG_NAME, base_lv_name):
+        umount(_base_mount_path(config, project_name))
 
     # 1. Lazy snapshot: create if not exists
-    if not lv_exists(vg_name, snapshot_lv_name):
-        create_snapshot(vg_name, base_lv_name, snapshot_lv_name)
+    if not lv_exists(VG_NAME, snapshot_lv_name):
+        create_snapshot(VG_NAME, base_lv_name, snapshot_lv_name)
 
     # Ensure snapshot LV is activated (thin snapshots have activation skip flag)
-    activate_lv(vg_name, snapshot_lv_name)
+    activate_lv(VG_NAME, snapshot_lv_name)
 
     # 2. Mount snapshot
     os.makedirs(mount_path, exist_ok=True)
-    if not is_lv_mounted(vg_name, snapshot_lv_name):
-        mount(f"/dev/{vg_name}/{snapshot_lv_name}", mount_path)
+    if not is_lv_mounted(VG_NAME, snapshot_lv_name):
+        mount(f"/dev/{VG_NAME}/{snapshot_lv_name}", mount_path)
 
     # Fix ownership: mount via sudo makes root own the mount point
     _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
 
     # 3. Start container
-    c_name = container_name(bp["name"], workspace_name)
+    c_name = container_name(project_name, workspace_name)
     if docker_container_exists(c_name):
         docker_rm(c_name)
     uid = os.getuid()
     gid = os.getgid()
-    docker_run(c_name, mount_path, f"/{bp['name']}", docker_image, uid=uid, gid=gid)
+    docker_run(c_name, mount_path, f"/{project_name}", docker_image, uid=uid, gid=gid)
 
     # 4. Update status
     ws["status"] = "active"
@@ -590,8 +597,6 @@ def deactivate(ctx, workspace_name):
     """Deactivate a workspace (stop container + unmount)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
 
     bp = None
     ws = None
@@ -611,7 +616,7 @@ def deactivate(ctx, workspace_name):
         return
 
     c_name = container_name(bp["name"], workspace_name)
-    mount_path = ws["mount_path"]
+    mount_path = _workspace_mount_path(config, bp["name"], workspace_name)
 
     # 1. Stop and remove container
     if docker_container_exists(c_name):
@@ -634,8 +639,6 @@ def remove(ctx, workspace_name):
     """Remove a workspace entirely (deactivate + destroy snapshot)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
 
     bp = None
     ws = None
@@ -661,13 +664,14 @@ def remove(ctx, workspace_name):
         c_name = container_name(bp["name"], workspace_name)
         if docker_container_exists(c_name):
             docker_rm(c_name)
-        if is_mounted(ws["mount_path"]):
-            umount(ws["mount_path"])
+        mount_path = _workspace_mount_path(config, bp["name"], workspace_name)
+        if is_mounted(mount_path):
+            umount(mount_path)
 
     # 2. Destroy snapshot LV
-    snapshot_lv_name = ws["snapshot_lv_name"]
-    if lv_exists(vg_name, snapshot_lv_name):
-        remove_lv(vg_name, snapshot_lv_name)
+    snapshot_lv_name = _snapshot_lv_name(workspace_name)
+    if lv_exists(VG_NAME, snapshot_lv_name):
+        remove_lv(VG_NAME, snapshot_lv_name)
 
     # 3. Remove from config
     config["base_projects"][bp_idx]["workspaces"].pop(ws_idx)
@@ -682,17 +686,15 @@ def sync(ctx, base):
     """Force re-sync and re-compile the base (destroys all workspaces)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-    g = config["global"]
-    vg_name = g["lvm_vg_name"]
-    mode = g["mode"]
+    mode = config["global"]["mode"]
 
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
 
-    base_lv_name = bp["base_lv_name"]
-    base_mount_path = bp["base_mount_path"]
+    project_name = bp["name"]
+    base_mount_path = _base_mount_path(config, project_name)
     docker_image = bp["docker_image"]
 
     # 1. Destroy all workspaces
@@ -702,10 +704,12 @@ def sync(ctx, base):
         c_name = container_name(base, ws_name)
         if docker_container_exists(c_name):
             docker_rm(c_name)
-        if is_mounted(ws["mount_path"]):
-            umount(ws["mount_path"])
-        if lv_exists(vg_name, ws["snapshot_lv_name"]):
-            remove_lv(vg_name, ws["snapshot_lv_name"])
+        ws_mount_path = _workspace_mount_path(config, base, ws_name)
+        if is_mounted(ws_mount_path):
+            umount(ws_mount_path)
+        snapshot_lv_name = _snapshot_lv_name(ws_name)
+        if lv_exists(VG_NAME, snapshot_lv_name):
+            remove_lv(VG_NAME, snapshot_lv_name)
 
     # Clear workspaces from config
     bp["workspaces"].clear()

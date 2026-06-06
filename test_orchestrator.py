@@ -36,7 +36,16 @@ from storage import (
     umount,
     docker_rm,
 )
-from main import get_base_project
+from main import (
+    get_base_project,
+    VG_NAME,
+    THIN_POOL_NAME,
+    _pool_image_path,
+    _base_lv_name,
+    _base_mount_path,
+    _snapshot_lv_name,
+    _workspace_mount_path,
+)
 
 
 def run_cli(*args) -> subprocess.CompletedProcess:
@@ -48,8 +57,7 @@ def run_cli(*args) -> subprocess.CompletedProcess:
 
 def run_link(name="xxx", repo_url="https://github.com/mock/manifest.git",
              repo_branch="main", docker_image="aosp-builder:mock",
-             base_lv_size_gb=1, base_mount_path="/tmp/aosp_workspaces/xxx/base_mount",
-             sync_type="repo"):
+             base_lv_size_gb=1, sync_type="repo"):
     """Run link command with all params (non-interactive)."""
     return run_cli(
         "link",
@@ -58,7 +66,6 @@ def run_link(name="xxx", repo_url="https://github.com/mock/manifest.git",
         "--repo-branch", repo_branch,
         "--docker-image", docker_image,
         "--base-lv-size-gb", str(base_lv_size_gb),
-        "--base-mount-path", base_mount_path,
         "--sync-type", sync_type,
     )
 
@@ -105,18 +112,21 @@ def cleanup_environment():
 def _force_cleanup():
     """Force cleanup all LVM, mounts, containers, and pool image."""
     config = read_config()
-    vg_name = config["global"]["lvm_vg_name"]
 
-    # Remove all workspace containers
+    # Remove all workspace containers and snapshots
     for bp in config.get("base_projects", []):
+        project_name = bp["name"]
         for ws in bp.get("workspaces", []):
-            c_name = f"aosp_{bp['name']}_{ws['name']}"
+            ws_name = ws["name"]
+            c_name = f"aosp_{project_name}_{ws_name}"
             if docker_container_exists(c_name):
                 docker_rm(c_name)
-            if is_mounted(ws["mount_path"]):
-                umount(ws["mount_path"])
-            if lv_exists(vg_name, ws["snapshot_lv_name"]):
-                remove_lv(vg_name, ws["snapshot_lv_name"])
+            ws_mount = _workspace_mount_path(config, project_name, ws_name)
+            if is_mounted(ws_mount):
+                umount(ws_mount)
+            snap_name = _snapshot_lv_name(ws_name)
+            if lv_exists(VG_NAME, snap_name):
+                remove_lv(VG_NAME, snap_name)
 
     # Remove default container
     for bp in config.get("base_projects", []):
@@ -126,21 +136,21 @@ def _force_cleanup():
 
     # Unmount and remove base LV
     for bp in config.get("base_projects", []):
-        if is_mounted(bp["base_mount_path"]):
-            umount(bp["base_mount_path"])
-        if lv_exists(vg_name, bp["base_lv_name"]):
-            remove_lv(vg_name, bp["base_lv_name"])
+        project_name = bp["name"]
+        base_mount = _base_mount_path(config, project_name)
+        if is_mounted(base_mount):
+            umount(base_mount)
+        base_lv = _base_lv_name(project_name)
+        if lv_exists(VG_NAME, base_lv):
+            remove_lv(VG_NAME, base_lv)
 
     # Remove thin pool and VG
-    if vg_exists(vg_name):
-        # Remove thin pool if exists
-        thin_pool = config["global"]["thin_pool_name"]
-        if lv_exists(vg_name, thin_pool):
-            remove_lv(vg_name, thin_pool)
-        # Remove VG
-        run_cmd(["sudo", "vgremove", "-ff", "-y", vg_name])
+    if vg_exists(VG_NAME):
+        if lv_exists(VG_NAME, THIN_POOL_NAME):
+            remove_lv(VG_NAME, THIN_POOL_NAME)
+        run_cmd(["sudo", "vgremove", "-ff", "-y", VG_NAME])
         # Detach loop devices associated with pool image
-        pool_image_path = config["global"]["pool_image_path"]
+        pool_image_path = _pool_image_path(config)
         result = run_cmd(["sudo", "losetup", "-j", pool_image_path])
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.strip().split("\n"):
@@ -149,7 +159,7 @@ def _force_cleanup():
                     run_cmd(["sudo", "losetup", "-d", dev])
 
     # Remove pool image (may be owned by root since fallocate runs with sudo)
-    pool_image_path = config["global"]["pool_image_path"]
+    pool_image_path = _pool_image_path(config)
     if os.path.exists(pool_image_path):
         run_cmd(["sudo", "rm", "-f", pool_image_path])
 
@@ -163,12 +173,9 @@ def _reset_config():
     config = tomlkit.document()
 
     g = tomlkit.table()
-    g["version"] = "3.2.0"
     g["mode"] = "mock"
-    g["pool_image_path"] = "/aosp_pool.img"
+    g["workdir"] = "/tmp/aosp_workspaces"
     g["pool_image_size_gb"] = 2
-    g["lvm_vg_name"] = "vgaosp_pool"
-    g["thin_pool_name"] = "aosp_thin_pool"
     config["global"] = g
 
     bp = tomlkit.table()
@@ -176,9 +183,7 @@ def _reset_config():
     bp["repo_url"] = "https://github.com/mock/manifest.git"
     bp["repo_branch"] = "main"
     bp["docker_image"] = "aosp-builder:mock"
-    bp["base_lv_name"] = "xxx_base_lv"
     bp["base_lv_size_gb"] = 1
-    bp["base_mount_path"] = "/tmp/aosp_workspaces/xxx/base_mount"
 
     build_config = tomlkit.table()
     build_config["setup_commands"] = [
@@ -207,7 +212,9 @@ class TestAssertion1Initialization:
         config = read_config()
         bp = get_base_project(config, "xxx")
         assert bp is not None, "Base project 'xxx' not found in config after link"
-        assert bp["base_lv_name"] == "xxx_base_lv"
+
+        # Verify auto-derived names
+        assert _base_lv_name("xxx") == "xxx_base_lv"
 
         # Verify TOML format: [[base_projects]] array with nested sub-tables
         raw = open(CONFIG_PATH, "r").read()
@@ -216,14 +223,21 @@ class TestAssertion1Initialization:
         assert "[base_projects.build_config.env_vars]" in raw, "TOML must have [base_projects.build_config.env_vars] sub-table"
         # Ensure no broken top-level tables leaked from the array
         assert not raw.startswith("base_projects = ["), "TOML must not use inline array syntax for base_projects"
+        # Ensure auto-derived fields are NOT stored in config
+        assert "base_lv_name" not in raw, "base_lv_name should be auto-derived, not stored in config"
+        assert "base_mount_path" not in raw, "base_mount_path should be auto-derived, not stored in config"
+        assert "lvm_vg_name" not in raw, "lvm_vg_name should be hardcoded, not stored in config"
+        assert "thin_pool_name" not in raw, "thin_pool_name should be hardcoded, not stored in config"
 
     def test_activate_creates_pool_image(self):
-        """After activate (lazy), /aosp_pool.img must exist."""
+        """After activate (lazy), pool image must exist under workdir."""
         run_link()
         run_cli("create", "a", "--base", "xxx")
         result = run_cli("activate", "a")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
-        assert os.path.exists("/aosp_pool.img"), "Pool image /aosp_pool.img not created"
+        config = read_config()
+        pool_image = _pool_image_path(config)
+        assert os.path.exists(pool_image), f"Pool image {pool_image} not created"
 
     def test_activate_creates_vg_and_base_lv_with_mock_output(self):
         """After activate (lazy), VG must be active and base LV must contain mock_system.img."""
@@ -233,22 +247,20 @@ class TestAssertion1Initialization:
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         # VG must exist
-        assert vg_exists("vgaosp_pool"), "VG vgaosp_pool not active"
+        assert vg_exists(VG_NAME), f"VG {VG_NAME} not active"
 
         # Base LV must contain mock content - mount it to verify
         config = read_config()
-        vg_name = config["global"]["lvm_vg_name"]
-        base_lv_name = config["base_projects"][0]["base_lv_name"]
-        base_mount_path = config["base_projects"][0]["base_mount_path"]
+        base_lv_name = _base_lv_name("xxx")
+        base_mount_path = _base_mount_path(config, "xxx")
 
         # The base LV may be unmounted after activate (snapshot is mounted instead)
-        # So we need to mount it separately to check
-        if not is_lv_mounted(vg_name, base_lv_name):
+        if not is_lv_mounted(VG_NAME, base_lv_name):
             from storage import activate_lv
-            activate_lv(vg_name, base_lv_name)
+            activate_lv(VG_NAME, base_lv_name)
             from storage import mount as do_mount
             os.makedirs(base_mount_path, exist_ok=True)
-            do_mount(f"/dev/{vg_name}/{base_lv_name}", base_mount_path)
+            do_mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
 
         mock_img = os.path.join(base_mount_path, "out", "mock_system.img")
         assert os.path.exists(mock_img), f"mock_system.img not found at {mock_img}"
@@ -379,14 +391,10 @@ class TestAssertion4ForceSync:
         result = run_cli("sync", "--base", "xxx")
         assert result.returncode == 0, f"sync failed: {result.stderr}"
 
-        # Assert: b_snapshot_lv must be destroyed
-        config = read_config()
-        vg_name = config["global"]["lvm_vg_name"]
-        assert not lv_exists(vg_name, "b_snapshot_lv"), \
+        # Assert: snapshot LVs must be destroyed
+        assert not lv_exists(VG_NAME, _snapshot_lv_name("b")), \
             "b_snapshot_lv still exists after sync"
-
-        # Assert: a_snapshot_lv must be destroyed too
-        assert not lv_exists(vg_name, "a_snapshot_lv"), \
+        assert not lv_exists(VG_NAME, _snapshot_lv_name("a")), \
             "a_snapshot_lv still exists after sync"
 
         # Assert: workspaces cleared from config
@@ -403,7 +411,7 @@ class TestAssertion4ForceSync:
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
         # Assert: b_snapshot_lv is recreated (lazy load)
-        assert lv_exists(vg_name, "b_snapshot_lv"), \
+        assert lv_exists(VG_NAME, _snapshot_lv_name("b")), \
             "b_snapshot_lv not recreated on activate after sync"
 
         # Assert: b is in clean state (no dirty.txt from before)
@@ -417,43 +425,33 @@ class TestSnapshotSpaceSaving:
 
     def test_snapshot_data_percent_is_low(self):
         """A freshly created snapshot should have very low data_percent (space saving)."""
-        # Setup: link
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
-        # Create and activate workspace
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
         result = run_cli("activate", "a")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
-        config = read_config()
-        vg_name = config["global"]["lvm_vg_name"]
-
         # Check data_percent of snapshot - should be very low since we just created it
-        data_pct = get_lv_data_percent(vg_name, "a_snapshot_lv")
+        data_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
         assert data_pct < 50.0, \
             f"Snapshot data_percent is {data_pct}%, expected < 50% for a fresh snapshot (space saving not working)"
 
     def test_snapshot_only_stores_deltas(self):
         """Writing to a workspace should increase data_percent, but base LV should be unaffected."""
-        # Setup: link
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
-        # Create and activate workspace
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
         result = run_cli("activate", "a")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
-        config = read_config()
-        vg_name = config["global"]["lvm_vg_name"]
-
         # Get initial data_percent
-        initial_pct = get_lv_data_percent(vg_name, "a_snapshot_lv")
+        initial_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
 
         # Write a significant amount of data to the workspace
         from storage import docker_exec
@@ -466,25 +464,21 @@ class TestSnapshotSpaceSaving:
         run_cmd(["sync"])
 
         # Get data_percent after writing
-        after_pct = get_lv_data_percent(vg_name, "a_snapshot_lv")
+        after_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
 
         # Data percent should have increased
         assert after_pct > initial_pct, \
             f"Snapshot data_percent did not increase after writing data (before: {initial_pct}%, after: {after_pct}%)"
 
         # The snapshot should still be using less space than a full copy
-        # (data_percent represents the percentage of the LV's virtual size that is actually used)
-        # For a 1GB LV with 20MB written, data_percent should be well under 100%
         assert after_pct < 50.0, \
             f"Snapshot data_percent is {after_pct}%, space saving mechanism not effective"
 
     def test_multiple_snapshots_share_base(self):
         """Multiple workspaces should share the base data, not duplicate it."""
-        # Setup: link
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
-        # Create and activate two workspaces
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0
 
@@ -497,23 +491,17 @@ class TestSnapshotSpaceSaving:
         result = run_cli("activate", "b")
         assert result.returncode == 0
 
-        config = read_config()
-        vg_name = config["global"]["lvm_vg_name"]
-
         # Both snapshots should have low data_percent (mostly sharing base)
-        pct_a = get_lv_data_percent(vg_name, "a_snapshot_lv")
-        pct_b = get_lv_data_percent(vg_name, "b_snapshot_lv")
+        pct_a = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
+        pct_b = get_lv_data_percent(VG_NAME, _snapshot_lv_name("b"))
 
-        # Both should be using minimal space since they share the base
         assert pct_a < 50.0, f"Snapshot a data_percent is {pct_a}%, expected < 50%"
         assert pct_b < 50.0, f"Snapshot b data_percent is {pct_b}%, expected < 50%"
 
         # Get thin pool usage to verify total space is much less than 2x base
-        pool_info = get_lv_size_info(vg_name, config["global"]["thin_pool_name"])
-        base_info = get_lv_size_info(vg_name, config["base_projects"][0]["base_lv_name"])
+        pool_info = get_lv_size_info(VG_NAME, THIN_POOL_NAME)
+        base_info = get_lv_size_info(VG_NAME, _base_lv_name("xxx"))
 
-        # The thin pool data usage should be less than the sum of all virtual LV sizes
-        # This proves snapshots are sharing data
         logger_msg = (f"Thin pool data%: {pool_info.get('data_percent', 'N/A')}%, "
                       f"Base LV size: {base_info.get('lv_size_mb', 'N/A')}MB, "
                       f"Snapshot a data%: {pct_a}%, Snapshot b data%: {pct_b}%")
