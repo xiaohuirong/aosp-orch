@@ -259,7 +259,7 @@ def init(ctx, mode, pool_image_path, pool_image_size_gb, lvm_vg_name, thin_pool_
         g["thin_pool_name"] = click.prompt("精简池名称", default=thin_pool_name or defaults["thin_pool_name"])
 
     # Ensure base_projects exists
-    config.setdefault("base_projects", [])
+    config.setdefault("base_projects", tomlkit.aot())
 
     save_config(config, config_path)
     click.echo(f"\n配置已保存到 {config_path}")
@@ -340,7 +340,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, base_m
 
         bp["workspaces"] = tomlkit.aot()
 
-        config.setdefault("base_projects", []).append(bp)
+        config.setdefault("base_projects", tomlkit.aot()).append(bp)
     else:
         # Update existing base project with any provided values
         if repo_url is not None:

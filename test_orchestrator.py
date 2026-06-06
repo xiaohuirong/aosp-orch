@@ -199,13 +199,21 @@ class TestAssertion1Initialization:
     """断言 1: 初始化验证（link 只写配置，activate 懒加载触发 LVM 操作）"""
 
     def test_link_writes_config(self):
-        """After link, config.toml must contain the base project."""
+        """After link, config.toml must contain the base project with correct TOML format."""
         result = run_link()
         assert result.returncode == 0, f"link failed: {result.stderr}"
         config = read_config()
         bp = get_base_project(config, "xxx")
         assert bp is not None, "Base project 'xxx' not found in config after link"
         assert bp["base_lv_name"] == "xxx_base_lv"
+
+        # Verify TOML format: [[base_projects]] array with nested sub-tables
+        raw = open(CONFIG_PATH, "r").read()
+        assert "[[base_projects]]" in raw, "TOML must use [[base_projects]] array-of-tables syntax"
+        assert "[base_projects.build_config]" in raw, "TOML must have [base_projects.build_config] sub-table"
+        assert "[base_projects.build_config.env_vars]" in raw, "TOML must have [base_projects.build_config.env_vars] sub-table"
+        # Ensure no broken top-level tables leaked from the array
+        assert not raw.startswith("base_projects = ["), "TOML must not use inline array syntax for base_projects"
 
     def test_activate_creates_pool_image(self):
         """After activate (lazy), /aosp_pool.img must exist."""
