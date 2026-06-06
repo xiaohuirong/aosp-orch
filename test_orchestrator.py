@@ -113,7 +113,7 @@ def _force_cleanup():
     """Force cleanup all LVM, mounts, containers, and pool image."""
     config = read_config()
 
-    # Remove all workspace containers and snapshots
+    # Remove all workspace containers (from config)
     for bp in config.get("base_projects", []):
         project_name = bp["name"]
         for ws in bp.get("workspaces", []):
@@ -121,12 +121,6 @@ def _force_cleanup():
             c_name = f"aosp_{project_name}_{ws_name}"
             if docker_container_exists(c_name):
                 docker_rm(c_name)
-            ws_mount = _workspace_mount_path(config, project_name, ws_name)
-            if is_mounted(ws_mount):
-                umount(ws_mount)
-            snap_name = _snapshot_lv_name(ws_name)
-            if lv_exists(VG_NAME, snap_name):
-                remove_lv(VG_NAME, snap_name)
 
     # Remove default container
     for bp in config.get("base_projects", []):
@@ -134,18 +128,36 @@ def _force_cleanup():
         if docker_container_exists(c_name):
             docker_rm(c_name)
 
-    # Unmount and remove base LV
-    for bp in config.get("base_projects", []):
-        project_name = bp["name"]
-        base_mount = _base_mount_path(config, project_name)
-        if is_mounted(base_mount):
-            umount(base_mount)
-        base_lv = _base_lv_name(project_name)
-        if lv_exists(VG_NAME, base_lv):
-            remove_lv(VG_NAME, base_lv)
+    # Remove ALL containers matching aosp_ pattern (catches orphans)
+    result = run_cmd(["docker", "ps", "-a", "--filter", f"name=aosp_", "--format", "{{.Names}}"])
+    if result.returncode == 0 and result.stdout.strip():
+        for c_name in result.stdout.strip().split("\n"):
+            c_name = c_name.strip()
+            if c_name:
+                docker_rm(c_name)
 
-    # Remove thin pool and VG
+    # Unmount everything under workdir AND all VG mounts (catches orphans from other workdirs)
+    workdir = config.get("global", {}).get("workdir", "/tmp/aosp_workspaces")
+    mount_result = run_cmd(["mount"])
+    if mount_result.returncode == 0:
+        for line in mount_result.stdout.strip().split("\n"):
+            parts = line.split()
+            mount_point = parts[2] if len(parts) > 2 else ""
+            # Unmount if under workdir OR if it's a VG device mount
+            if (workdir in line or f"/dev/mapper/{VG_NAME}-" in line or f"/dev/{VG_NAME}/" in line) and mount_point:
+                umount(mount_point)
+
+    # Remove ALL LVs in the VG (not just those in config — catches orphans)
     if vg_exists(VG_NAME):
+        lvs_result = run_cmd(["sudo", "lvs", "--noheadings", "-o", "lv_name", VG_NAME])
+        if lvs_result.returncode == 0 and lvs_result.stdout.strip():
+            # Remove snapshots first, then base LVs, then pool
+            lv_names = [name.strip() for name in lvs_result.stdout.strip().split("\n") if name.strip()]
+            # Sort: thin pool last, snapshots before base
+            for lv_name in sorted(lv_names, key=lambda n: (n == THIN_POOL_NAME, "_snapshot_lv" not in n)):
+                if lv_name != THIN_POOL_NAME:
+                    remove_lv(VG_NAME, lv_name)
+        # Remove thin pool last
         if lv_exists(VG_NAME, THIN_POOL_NAME):
             remove_lv(VG_NAME, THIN_POOL_NAME)
         run_cmd(["sudo", "vgremove", "-ff", "-y", VG_NAME])
@@ -224,7 +236,7 @@ class TestAssertion1Initialization:
         """After activate (lazy), pool image must exist under workdir."""
         run_link()
         run_cli("create", "a", "--base", "xxx")
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
         config = read_config()
         pool_image = _pool_image_path(config)
@@ -234,7 +246,7 @@ class TestAssertion1Initialization:
         """After activate (lazy), VG must be active and base LV must contain mock_system.img."""
         run_link()
         run_cli("create", "a", "--base", "xxx")
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         # VG must exist
@@ -277,7 +289,7 @@ class TestAssertion2SnapshotIsolation:
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
         # Step 3: activate workspace a
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Step 4: write ai_code.txt in workspace a container
@@ -294,7 +306,7 @@ class TestAssertion2SnapshotIsolation:
         assert result.returncode == 0, f"create b failed: {result.stderr}"
 
         # Step 6: activate workspace b
-        result = run_cli("activate", "b")
+        result = run_cli("activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # Step 7: ASSERT ai_code.txt must NOT exist in workspace b
@@ -316,7 +328,7 @@ class TestAssertion3DeactivationIdempotency:
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Verify it's active
@@ -330,7 +342,7 @@ class TestAssertion3DeactivationIdempotency:
         assert ws is not None and ws["status"] == "active"
 
         # Deactivate
-        result = run_cli("deactivate", "a")
+        result = run_cli("deactivate", "a", "--base", "xxx")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
         # Assert: mount | grep a_snapshot_lv must return empty
@@ -365,13 +377,13 @@ class TestAssertion4ForceSync:
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         result = run_cli("create", "b", "--base", "xxx")
         assert result.returncode == 0, f"create b failed: {result.stderr}"
 
-        result = run_cli("activate", "b")
+        result = run_cli("activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # Write something in b to make it dirty
@@ -398,7 +410,7 @@ class TestAssertion4ForceSync:
         result = run_cli("create", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-create b failed: {result.stderr}"
 
-        result = run_cli("activate", "b")
+        result = run_cli("activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
         # Assert: b_snapshot_lv is recreated (lazy load)
@@ -422,7 +434,7 @@ class TestSnapshotSpaceSaving:
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Check data_percent of snapshot - should be very low since we just created it
@@ -438,7 +450,7 @@ class TestSnapshotSpaceSaving:
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0, f"create a failed: {result.stderr}"
 
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Get initial data_percent
@@ -473,13 +485,13 @@ class TestSnapshotSpaceSaving:
         result = run_cli("create", "a", "--base", "xxx")
         assert result.returncode == 0
 
-        result = run_cli("activate", "a")
+        result = run_cli("activate", "a", "--base", "xxx")
         assert result.returncode == 0
 
         result = run_cli("create", "b", "--base", "xxx")
         assert result.returncode == 0
 
-        result = run_cli("activate", "b")
+        result = run_cli("activate", "b", "--base", "xxx")
         assert result.returncode == 0
 
         # Both snapshots should have low data_percent (mostly sharing base)

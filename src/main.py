@@ -198,6 +198,7 @@ def ensure_pool_and_vg(config: dict) -> str | None:
 
     # Create pool image
     if not os.path.exists(pool_image_path):
+        os.makedirs(os.path.dirname(pool_image_path), exist_ok=True)
         create_pool_image(pool_image_path, pool_size_gb)
 
     # Setup loop device
@@ -231,10 +232,14 @@ def _run_sync(c_name: str, bp: dict) -> None:
 
 
 def _ensure_base_lv(config: dict, bp: dict) -> None:
-    """Lazy-init: ensure pool, VG, base LV exist, are formatted, mounted, and populated.
+    """Lazy-init: ensure pool, VG, base LV exist, are formatted, and populated.
 
     This is the core lazy-load logic called by activate/sync/compile when they
     discover the base infrastructure is missing.
+
+    Optimization: only mounts the base LV when first-time population is needed.
+    If the base LV already exists and is initialized, we skip the mount/unmount
+    cycle entirely — snapshots are taken from the unmounted base for consistency.
     """
     mode = config["global"]["mode"]
     project_name = bp["name"]
@@ -250,20 +255,27 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
         create_thin_lv(VG_NAME, THIN_POOL_NAME, base_lv_name, bp["base_lv_size_gb"])
         format_ext4(f"/dev/{VG_NAME}/{base_lv_name}")
 
-    # Ensure base LV is activated
-    activate_lv(VG_NAME, base_lv_name)
+    # 3. Check if population is needed (without mounting if possible)
+    #    If base LV exists and is not mounted, we need to mount briefly to check marker.
+    #    If base LV is already mounted (e.g. from a previous interrupted run), check directly.
+    needs_populate = False
+    was_already_mounted = is_lv_mounted(VG_NAME, base_lv_name)
 
-    # 3. Mount base LV if not mounted
-    os.makedirs(base_mount_path, exist_ok=True)
-    if not is_lv_mounted(VG_NAME, base_lv_name):
+    if was_already_mounted:
+        # Already mounted — check marker directly
+        marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+        needs_populate = not os.path.exists(marker)
+    else:
+        # Not mounted — we must mount to check if population is needed
+        activate_lv(VG_NAME, base_lv_name)
+        os.makedirs(base_mount_path, exist_ok=True)
         mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
-
-    # Fix ownership
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+        _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+        marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+        needs_populate = not os.path.exists(marker)
 
     # 4. Populate if empty (first-time setup)
-    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
-    if not os.path.exists(marker):
+    if needs_populate:
         if mode == "mock":
             if not docker_image_exists(docker_image):
                 docker_build_mock(docker_image)
@@ -286,6 +298,11 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
         # Write marker
         with open(marker, "w") as f:
             f.write("initialized")
+
+    # 5. Unmount base LV if we mounted it (snapshots must be taken from unmounted base
+    #    for filesystem consistency — crash-consistent snapshots are not guaranteed)
+    if not was_already_mounted and is_lv_mounted(VG_NAME, base_lv_name):
+        umount(base_mount_path)
 
 
 # ── CLI Commands ──────────────────────────────────────────────
@@ -493,24 +510,21 @@ def create(ctx, workspace_name, base):
 
 @cli.command()
 @click.argument("workspace_name")
+@click.option("--base", required=True, help="Base project name")
 @click.pass_context
-def activate(ctx, workspace_name):
+def activate(ctx, workspace_name, base):
     """Activate a workspace (lazy snapshot + mount + container)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
-    # Find the workspace across all base projects
-    bp = None
-    ws = None
-    for b in config.get("base_projects", []):
-        w = get_workspace(b, workspace_name)
-        if w is not None:
-            bp = b
-            ws = w
-            break
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
 
+    ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
     if ws["status"] == "active":
@@ -524,11 +538,9 @@ def activate(ctx, workspace_name):
     docker_image = bp["docker_image"]
 
     # Lazy: ensure base LV exists and is populated before creating snapshot
+    # _ensure_base_lv handles mount/unmount internally — base LV will be
+    # unmounted after this call (snapshots are taken from unmounted base)
     _ensure_base_lv(config, bp)
-
-    # Unmount base LV after ensuring it's populated (snapshots are taken from unmounted base)
-    if is_lv_mounted(VG_NAME, base_lv_name):
-        umount(_base_mount_path(config, project_name))
 
     # 1. Lazy snapshot: create if not exists
     if not lv_exists(VG_NAME, snapshot_lv_name):
@@ -561,23 +573,21 @@ def activate(ctx, workspace_name):
 
 @cli.command()
 @click.argument("workspace_name")
+@click.option("--base", required=True, help="Base project name")
 @click.pass_context
-def enter(ctx, workspace_name):
+def enter(ctx, workspace_name, base):
     """Enter a workspace container interactively."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
-    bp = None
-    ws = None
-    for b in config.get("base_projects", []):
-        w = get_workspace(b, workspace_name)
-        if w is not None:
-            bp = b
-            ws = w
-            break
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
 
+    ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
     if ws["status"] != "active":
@@ -590,23 +600,21 @@ def enter(ctx, workspace_name):
 
 @cli.command()
 @click.argument("workspace_name")
+@click.option("--base", required=True, help="Base project name")
 @click.pass_context
-def deactivate(ctx, workspace_name):
+def deactivate(ctx, workspace_name, base):
     """Deactivate a workspace (stop container + unmount)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
-    bp = None
-    ws = None
-    for b in config.get("base_projects", []):
-        w = get_workspace(b, workspace_name)
-        if w is not None:
-            bp = b
-            ws = w
-            break
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
 
+    ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
     if ws["status"] == "inactive":
@@ -632,29 +640,28 @@ def deactivate(ctx, workspace_name):
 
 @cli.command()
 @click.argument("workspace_name")
+@click.option("--base", required=True, help="Base project name")
 @click.pass_context
-def remove(ctx, workspace_name):
+def remove(ctx, workspace_name, base):
     """Remove a workspace entirely (deactivate + destroy snapshot)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
 
-    bp = None
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+
     ws = None
-    bp_idx = None
     ws_idx = None
-    for bi, b in enumerate(config.get("base_projects", [])):
-        for wi, w in enumerate(b.get("workspaces", [])):
-            if w["name"] == workspace_name:
-                bp = b
-                ws = w
-                bp_idx = bi
-                ws_idx = wi
-                break
-        if bp is not None:
+    for wi, w in enumerate(bp.get("workspaces", [])):
+        if w["name"] == workspace_name:
+            ws = w
+            ws_idx = wi
             break
 
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
     # 1. Deactivate if active
@@ -672,7 +679,7 @@ def remove(ctx, workspace_name):
         remove_lv(VG_NAME, snapshot_lv_name)
 
     # 3. Remove from config
-    config["base_projects"][bp_idx]["workspaces"].pop(ws_idx)
+    bp["workspaces"].pop(ws_idx)
     save_config(config, config_path)
     click.echo(f"Workspace '{workspace_name}' removed.")
 
@@ -713,15 +720,23 @@ def sync(ctx, base):
     bp["workspaces"].clear()
     save_config(config, config_path)
 
-    # 2. Ensure base LV exists (lazy)
+    # 2. Ensure base LV exists (lazy) — this leaves base LV unmounted
     _ensure_base_lv(config, bp)
 
-    # 3. Remove initialization marker to force re-populate
+    # 3. Mount base LV for re-population
+    base_lv_name = _base_lv_name(project_name)
+    activate_lv(VG_NAME, base_lv_name)
+    os.makedirs(base_mount_path, exist_ok=True)
+    if not is_lv_mounted(VG_NAME, base_lv_name):
+        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+
+    # 4. Remove initialization marker to force re-populate
     marker = os.path.join(base_mount_path, ".aosp_base_initialized")
     if os.path.exists(marker):
         os.remove(marker)
 
-    # Re-populate
+    # 5. Re-populate
     if mode == "mock":
         if not docker_image_exists(docker_image):
             docker_build_mock(docker_image)
@@ -746,8 +761,9 @@ def sync(ctx, base):
     with open(marker, "w") as f:
         f.write("initialized")
 
-    # 4. Unmount base LV
-    umount(base_mount_path)
+    # 6. Unmount base LV (snapshots should be taken from unmounted base)
+    if is_lv_mounted(VG_NAME, base_lv_name):
+        umount(base_mount_path)
     click.echo(f"Base project '{base}' synced successfully.")
 
 
