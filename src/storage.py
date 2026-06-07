@@ -48,7 +48,7 @@ def get_loop_device_for_image(image_path: str) -> str | None:
     result = _sudo_run(["losetup", "-j", image_path], check=False)
     if result.returncode != 0 or not result.stdout.strip():
         return None
-    # Output format: /dev/loopX: [xxxx]: (/aosp_pool.img)
+    # Output format: /dev/loopX: [xxxx]: (/pool.img)
     return result.stdout.split(":")[0].strip()
 
 

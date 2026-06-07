@@ -48,9 +48,9 @@ DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "aosp-orch
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yaml")
 
 # Hardcoded constants - not configurable to prevent accidental changes
-VG_NAME = "vgaosp_pool"
-THIN_POOL_NAME = "aosp_thin_pool"
-POOL_IMAGE_FILENAME = "aosp_pool.img"
+VG_NAME = "vg0"
+THIN_POOL_NAME = "pool0"
+POOL_IMAGE_FILENAME = "pool.img"
 
 
 # ── Path derivation helpers ──────────────────────────────────
@@ -62,7 +62,7 @@ def _pool_image_path(config: dict) -> str:
 
 def _base_lv_name(project_name: str) -> str:
     """Generate base LV name from project name."""
-    return f"{project_name}_base_lv"
+    return project_name
 
 
 def _base_mount_path(config: dict, project_name: str) -> str:
@@ -72,7 +72,7 @@ def _base_mount_path(config: dict, project_name: str) -> str:
 
 def _snapshot_lv_name(workspace_name: str) -> str:
     """Generate snapshot LV name from workspace name."""
-    return f"{workspace_name}_snapshot_lv"
+    return f"s-{workspace_name}"
 
 
 def _workspace_mount_path(config: dict, project_name: str, workspace_name: str) -> str:

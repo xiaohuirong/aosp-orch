@@ -233,7 +233,7 @@ def _force_cleanup_all():
             for lv_name in lv_names:
                 run_cmd(["sudo", "lvchange", "-an", f"/dev/{VG_NAME}/{lv_name}"])
             # Remove snapshots first, then base LVs, then pool
-            for lv_name in sorted(lv_names, key=lambda n: (n == THIN_POOL_NAME, "_snapshot_lv" not in n)):
+            for lv_name in sorted(lv_names, key=lambda n: (n == THIN_POOL_NAME, not n.startswith("s-"))):
                 run_cmd(["sudo", "lvremove", "-ff", "-y", f"/dev/{VG_NAME}/{lv_name}"])
 
         # Force remove VG and PV
@@ -241,7 +241,7 @@ def _force_cleanup_all():
 
     # Detach all loop devices associated with any pool image
     for wd in workdirs:
-        pool_image_path = os.path.join(wd, "aosp_pool.img")
+        pool_image_path = os.path.join(wd, "pool.img")
         result = run_cmd(["sudo", "losetup", "-j", pool_image_path])
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.strip().split("\n"):
@@ -251,7 +251,7 @@ def _force_cleanup_all():
 
     # Remove pool images and workdirs
     for wd in workdirs:
-        pool_image_path = os.path.join(wd, "aosp_pool.img")
+        pool_image_path = os.path.join(wd, "pool.img")
         if os.path.exists(pool_image_path):
             run_cmd(["sudo", "rm", "-f", pool_image_path])
         if os.path.exists(wd):
@@ -279,7 +279,7 @@ class TestAssertion1Initialization:
         assert bp is not None, "Base project 'xxx' not found in config after link"
 
         # Verify auto-derived names
-        assert _base_lv_name("xxx") == "xxx_base_lv"
+        assert _base_lv_name("xxx") == "xxx"
 
         # Ensure auto-derived fields are NOT stored in config
         raw = open(mock_config_path, "r").read()
@@ -377,10 +377,10 @@ class TestAssertion3DeactivationIdempotency:
         result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
-        # Assert: mount | grep a_snapshot_lv must return empty
+        # Assert: mount | grep s-a must return empty
         mount_result = run_cmd(["mount"])
-        assert "a_snapshot_lv" not in mount_result.stdout, \
-            f"a_snapshot_lv still mounted after deactivate"
+        assert "s-a" not in mount_result.stdout, \
+            f"s-a still mounted after deactivate"
 
         # Assert: Docker container must not exist
         assert not docker_container_exists("aosp_xxx_a"), \
@@ -411,9 +411,9 @@ class TestAssertion4ForceSync:
 
         # Assert: snapshot LVs must be destroyed
         assert not lv_exists(VG_NAME, _snapshot_lv_name("b")), \
-            "b_snapshot_lv still exists after sync"
+            "s-b still exists after sync"
         assert not lv_exists(VG_NAME, _snapshot_lv_name("a")), \
-            "a_snapshot_lv still exists after sync"
+            "s-a still exists after sync"
 
         # Assert: workspaces kept in config
         config = read_config(mock_config_path)
@@ -426,9 +426,9 @@ class TestAssertion4ForceSync:
         result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
-        # Assert: b_snapshot_lv is recreated (lazy load)
+        # Assert: s-b is recreated (lazy load)
         assert lv_exists(VG_NAME, _snapshot_lv_name("b")), \
-            "b_snapshot_lv not recreated on activate after sync"
+            "s-b not recreated on activate after sync"
 
         # Assert: b is in clean state (no dirty.txt from before)
         result = docker_exec("aosp_xxx_b", "ls /xxx/dirty.txt 2>&1; echo EXIT_CODE=$?")

@@ -33,6 +33,7 @@ global:
   mode: mock
   workdir: /tmp/aosp_workspaces
   pool_image_size_gb: 2
+  default_base: xxx
 
 base_projects:
   - name: xxx
@@ -54,18 +55,18 @@ base_projects:
 ### 设计原则：配置文件只存用户需要关心的内容
 
 **硬编码常量**（不存配置、不问用户）：
-- `lvm_vg_name` = `vgaosp_pool`
-- `thin_pool_name` = `aosp_thin_pool`
-- `pool_image_filename` = `aosp_pool.img`
+- `lvm_vg_name` = `vg0`
+- `thin_pool_name` = `pool0`
+- `pool_image_filename` = `pool.img`
 
 **自动推导路径**（从 `workdir` + 项目名/工作区名计算，不存配置）：
 
 | 字段 | 生成规则 | 示例（workdir=/tmp/aosp_workspaces, project=xxx） |
 |---|---|---|
-| pool image | `{workdir}/aosp_pool.img` | `/tmp/aosp_workspaces/aosp_pool.img` |
-| base_lv_name | `{project}_base_lv` | `xxx_base_lv` |
+| pool image | `{workdir}/pool.img` | `/tmp/aosp_workspaces/pool.img` |
+| base_lv_name | `{project}` | `xxx` |
 | base_mount_path | `{workdir}/{project}/base_mount` | `/tmp/aosp_workspaces/xxx/base_mount` |
-| snapshot_lv_name | `{workspace}_snapshot_lv` | `a_snapshot_lv` |
+| snapshot_lv_name | `s-{workspace}` | `s-a` |
 | workspace mount | `{workdir}/{project}/{workspace}` | `/tmp/aosp_workspaces/xxx/a` |
 
 **workspace 状态不存配置**：active/inactive 由 `docker_container_exists` 实时判断，配置文件中 workspace 只有 `name` 字段。
@@ -79,6 +80,25 @@ base_projects:
 ```
 --config PATH    指定配置文件路径（默认 ~/.config/aosp-orch/config.yaml）
 ```
+
+### `--base` 参数与 `default_base` 机制
+
+所有需要指定 base project 的命令都支持 `--base` 参数。`--base` 为可选参数，解析优先级：
+
+1. **`--base` 显式指定** → 使用指定值
+2. **`global.default_base`** → 使用配置中的默认项目
+3. **两者都没有** → 报错退出，提示用户使用 `--base` 或先 `link` 一个项目并设为默认
+
+`link` 命令交互模式下会询问"是否将此项目设为默认?"（默认 Y），确认后写入 `global.default_base`。
+
+### `workspace_name` 参数与 base LV 操作
+
+`mount`、`unmount`、`activate`、`deactivate`、`enter` 这 5 个命令的 `workspace_name` 参数为**可选**：
+
+- **指定 workspace_name** → 操作该 workspace 的快照卷
+- **不指定 workspace_name** → 操作 base LV 本身（挂载到 `base_mount`，容器名为 `{project}_default`）
+
+`create` 和 `remove` 的 `workspace_name` 仍为必填，因为它们只针对 workspace 操作。
 
 ### `init` —— 初始化全局配置
 
@@ -94,7 +114,9 @@ python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image
 
 ### `link` —— 配置 base project（仅写配置，不触发 LVM）
 
-交互式或全参数配置 base project。**纯元数据操作**，不创建任何 LVM 资源。LVM 操作延迟到 `activate`/`sync`/`compile` 时懒加载执行。支持 `--sync-type` 选择 repo/git 同步方式。
+交互式或全参数配置 base project。**纯元数据操作**，不创建任何 LVM 资源。LVM 操作延迟到 `activate`/`mount`/`sync`/`compile` 时懒加载执行。支持 `--sync-type` 选择 repo/git 同步方式。
+
+交互模式下会询问是否设为默认项目（写入 `global.default_base`）。
 
 ```bash
 # 交互式
@@ -105,6 +127,14 @@ python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
   --docker-image aosp-builder:mock --base-lv-size-gb 1 --sync-type repo
 ```
 
+### `unlink` —— 删除 base project（销毁所有资源 + 删除配置）
+
+销毁该 base project 下所有 workspace（停容器 + 卸载 + 删快照）、销毁 base LV、从配置中移除。若该项目是 `default_base`，自动清除。
+
+```bash
+python3 src/main.py unlink --base xxx
+```
+
 ### `create` —— 创建工作区（纯元数据）
 
 在配置文件中添加 workspace 条目（仅 `name` 字段），不触发任何 LVM/Docker 操作。
@@ -113,34 +143,69 @@ python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
 python3 src/main.py create <workspace_name> --base <project_name>
 ```
 
-### `activate` —— 激活工作区（懒加载 + 自动创建）
+### `mount` —— 挂载（不启动容器）
+
+懒加载快照 + 挂载 + 修复权限，**不启动容器**。适合仅需访问文件系统的场景。
+
+```bash
+# 挂载 workspace 快照
+python3 src/main.py mount <workspace_name> --base <project_name>
+
+# 挂载 base LV
+python3 src/main.py mount --base <project_name>
+```
+
+### `unmount` —— 卸载（不停止容器）
+
+卸载快照/base LV，**不停止容器**。适合需要保持容器运行但释放挂载点的场景。
+
+```bash
+# 卸载 workspace 快照
+python3 src/main.py unmount <workspace_name> --base <project_name>
+
+# 卸载 base LV
+python3 src/main.py unmount --base <project_name>
+```
+
+### `activate` —— 激活（mount + 启动容器）
 
 触发懒加载：若 base LV 不存在则自动创建池、VG、LV、格式化、填充内容。然后创建快照、挂载、启动容器。
 
 **自动创建**：若 workspace 不存在，询问用户是否创建（默认 Y），确认后自动创建并激活。
 
 ```bash
+# 激活 workspace
 python3 src/main.py activate <workspace_name> --base <project_name>
+
+# 激活 base LV（挂载 + 启动 default 容器）
+python3 src/main.py activate --base <project_name>
 ```
 
-### `enter` —— 进入工作区容器（自动补充前序步骤）
+### `enter` —— 进入容器（自动补充前序步骤）
 
-进入 workspace 容器交互 Shell。自动检查并补充前序步骤：
+进入容器交互 Shell。自动检查并补充前序步骤：
 
-1. **workspace 不存在** → 询问"是否创建?"（默认 Y）→ 自动 create
-2. **workspace 未激活** → 询问"是否激活?"（默认 Y）→ 自动 activate
-3. 进入容器 `docker exec -it`
+1. **容器不存在** → 询问"是否激活?"（默认 Y）→ 自动 activate
+2. 进入容器 `docker exec -it`
 
 ```bash
+# 进入 workspace 容器
 python3 src/main.py enter <workspace_name> --base <project_name>
+
+# 进入 base LV 的 default 容器
+python3 src/main.py enter --base <project_name>
 ```
 
-### `deactivate` —— 去激活工作区
+### `deactivate` —— 去激活（停容器 + 卸载）
 
-停容器、卸载，数据保留在快照卷中。幂等操作（已 inactive 时安全返回）。
+停容器、卸载，数据保留在快照卷/base LV 中。幂等操作（已 inactive 时安全返回）。
 
 ```bash
+# 去激活 workspace
 python3 src/main.py deactivate <workspace_name> --base <project_name>
+
+# 去激活 base LV（停 default 容器 + 卸载）
+python3 src/main.py deactivate --base <project_name>
 ```
 
 ### `remove` —— 彻底销毁工作区
@@ -171,7 +236,8 @@ python3 src/main.py compile --base <project_name>
 
 `link` 只写配置，不触发任何 LVM/Docker 操作。实际基础设施在需要时按需创建：
 
-- **`activate`** → 发现 base LV 不存在 → 自动创建池/VG/LV/格式化/填充 → 创建快照 → 挂载 → 启动容器
+- **`mount`** → 发现 base LV 不存在 → 自动创建池/VG/LV/格式化/填充 → 创建快照 → 挂载
+- **`activate`** → 调用 `mount` → 启动容器
 - **`sync`** → 同样懒加载确保基础设施就绪 → 清盘 → 重新填充
 - **`compile`** → `sync` 的别名
 
@@ -180,6 +246,18 @@ python3 src/main.py compile --base <project_name>
 ### `_ensure_base_lv` 优化
 
 只在首次填充时挂载 base LV（检查 marker），已填充的情况下跳过 mount/unmount 周期。函数结束后 base LV 保持卸载状态（快照从卸载的 base 创建以确保文件系统一致性）。
+
+### 命令复用关系
+
+```
+activate  = mount + docker_run
+deactivate = docker_rm + unmount
+remove    = deactivate + lvremove + 删配置
+sync      = _destroy_all_workspaces + _ensure_base_lv + 重新填充
+unlink    = _destroy_all_workspaces + lvremove(base) + 删配置
+```
+
+`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync` 和 `unlink` 复用。
 
 ---
 
@@ -304,3 +382,15 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 ### 测试间 VG 残留
 
 不同测试共享同一个 VG 名 `vgaosp_pool`，若前一个测试清理不彻底会导致 `vgcreate` 报 "already exists"。解决：使用 `tmp_path` fixture 为每个测试创建独立配置，不同测试使用不同 workdir；清理函数覆盖所有 workdir。
+
+### default_base 机制
+
+多个 base project 时每次都要传 `--base` 很繁琐。解决：在 `global` 中增加 `default_base` 字段，`link` 交互时询问是否设为默认，`--base` 参数改为可选，未指定时自动使用 `default_base`。
+
+### mount/unmount 细粒度控制
+
+原 `activate`/`deactivate` 将挂载和容器绑定在一起，无法单独操作。解决：拆出 `mount`/`unmount` 命令，`activate` = `mount` + 启动容器，`deactivate` = 停容器 + `unmount`。
+
+### 无 workspace 时操作 base LV
+
+用户经常需要直接操作 base LV（查看源码、手动编译等），之前必须创建一个 workspace。解决：`mount`/`unmount`/`activate`/`deactivate`/`enter` 的 `workspace_name` 改为可选，不传时操作 base LV 本身，容器名为 `{project}_default`。
