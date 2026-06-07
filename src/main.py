@@ -563,8 +563,91 @@ def create(ctx, workspace_name, base):
 @click.argument("workspace_name")
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
+def mount_cmd(ctx, workspace_name, base):
+    """挂载工作区快照（懒加载快照 + 挂载，不启动容器）。"""
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
+
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+
+    ws = get_workspace(bp, workspace_name)
+    if ws is None:
+        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
+            sys.exit(0)
+        ws = {"name": workspace_name}
+        bp.setdefault("workspaces", []).append(ws)
+        save_config(config, config_path)
+        click.echo(f"Workspace '{workspace_name}' created.")
+
+    project_name = bp["name"]
+    base_lv_name = _base_lv_name(project_name)
+    snapshot_lv_name = _snapshot_lv_name(workspace_name)
+    mount_path = _workspace_mount_path(config, project_name, workspace_name)
+
+    # Lazy: ensure base LV exists and is populated
+    _ensure_base_lv(config, bp)
+
+    # Lazy snapshot: create if not exists
+    if not lv_exists(VG_NAME, snapshot_lv_name):
+        create_snapshot(VG_NAME, base_lv_name, snapshot_lv_name)
+
+    # Ensure snapshot LV is activated
+    activate_lv(VG_NAME, snapshot_lv_name)
+
+    # Mount snapshot
+    os.makedirs(mount_path, exist_ok=True)
+    if not is_lv_mounted(VG_NAME, snapshot_lv_name):
+        mount(f"/dev/{VG_NAME}/{snapshot_lv_name}", mount_path)
+
+    # Fix ownership
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
+
+    click.echo(f"Workspace '{workspace_name}' mounted at {mount_path}.")
+
+
+@cli.command()
+@click.argument("workspace_name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
+@click.pass_context
+def unmount_cmd(ctx, workspace_name, base):
+    """卸载工作区快照（不停止容器）。"""
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
+
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+
+    ws = get_workspace(bp, workspace_name)
+    if ws is None:
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
+        sys.exit(1)
+
+    mount_path = _workspace_mount_path(config, bp["name"], workspace_name)
+    snapshot_lv_name = _snapshot_lv_name(workspace_name)
+
+    if not is_mounted(mount_path) and not is_lv_mounted(VG_NAME, snapshot_lv_name):
+        click.echo(f"Workspace '{workspace_name}' is already unmounted.")
+        return
+
+    if is_mounted(mount_path):
+        umount(mount_path)
+
+    click.echo(f"Workspace '{workspace_name}' unmounted.")
+
+
+@cli.command()
+@click.argument("workspace_name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
+@click.pass_context
 def activate(ctx, workspace_name, base):
-    """Activate a workspace (lazy snapshot + mount + container).
+    """Activate a workspace (mount + start container).
 
     Auto-creates the workspace if it doesn't exist yet.
     """
@@ -592,32 +675,13 @@ def activate(ctx, workspace_name, base):
         return
 
     project_name = bp["name"]
-    base_lv_name = _base_lv_name(project_name)
-    snapshot_lv_name = _snapshot_lv_name(workspace_name)
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
     docker_image = bp["docker_image"]
 
-    # Lazy: ensure base LV exists and is populated before creating snapshot
-    # _ensure_base_lv handles mount/unmount internally — base LV will be
-    # unmounted after this call (snapshots are taken from unmounted base)
-    _ensure_base_lv(config, bp)
+    # Mount (lazy snapshot + mount)
+    ctx.invoke(mount_cmd, workspace_name=workspace_name, base=base)
 
-    # 1. Lazy snapshot: create if not exists
-    if not lv_exists(VG_NAME, snapshot_lv_name):
-        create_snapshot(VG_NAME, base_lv_name, snapshot_lv_name)
-
-    # Ensure snapshot LV is activated (thin snapshots have activation skip flag)
-    activate_lv(VG_NAME, snapshot_lv_name)
-
-    # 2. Mount snapshot
-    os.makedirs(mount_path, exist_ok=True)
-    if not is_lv_mounted(VG_NAME, snapshot_lv_name):
-        mount(f"/dev/{VG_NAME}/{snapshot_lv_name}", mount_path)
-
-    # Fix ownership: mount via sudo makes root own the mount point
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
-
-    # 3. Start container
+    # Start container
     c_name = container_name(project_name, workspace_name)
     if docker_container_exists(c_name):
         docker_rm(c_name)
@@ -688,16 +752,13 @@ def deactivate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' is already inactive.")
         return
 
-    c_name = container_name(bp["name"], workspace_name)
-    mount_path = _workspace_mount_path(config, bp["name"], workspace_name)
-
     # 1. Stop and remove container
+    c_name = container_name(bp["name"], workspace_name)
     if docker_container_exists(c_name):
         docker_rm(c_name)
 
     # 2. Unmount
-    if is_mounted(mount_path):
-        umount(mount_path)
+    ctx.invoke(unmount_cmd, workspace_name=workspace_name, base=base)
 
     click.echo(f"Workspace '{workspace_name}' deactivated.")
 
