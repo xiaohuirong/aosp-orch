@@ -801,8 +801,10 @@ def enter(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
-        sys.exit(1)
+        if click.confirm(f"Workspace '{workspace_name}' 不存在，是否立即创建?", default=True):
+            ctx.invoke(create, workspace_name=workspace_name, base=base)
+        else:
+            sys.exit(1)
 
     if not _is_workspace_active(base, workspace_name):
         if click.confirm(f"Workspace '{workspace_name}' 未激活，是否立即激活?", default=True):
