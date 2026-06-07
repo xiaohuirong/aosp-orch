@@ -100,9 +100,9 @@ base_projects:
 
 `create` 和 `remove` 的 `workspace_name` 仍为必填，因为它们只针对 workspace 操作。
 
-### `init` —— 初始化全局配置
+### `init` —— 初始化全局配置 + 创建 LVM 磁盘
 
-交互式或全参数初始化 `global` 配置。只需设置 `mode`、`workdir`、`pool_image_size_gb`。
+交互式或全参数初始化 `global` 配置，并**立即创建** LVM 磁盘基础设施：pool image、loop device、VG、thin pool。设置 `mode`、`workdir`、`pool_image_size_gb`。
 
 ```bash
 # 交互式
@@ -112,9 +112,11 @@ python3 src/main.py init
 python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 ```
 
-### `link` —— 配置 base project 并创建 LVM 基础设施
+### `link` —— 配置 base project 并创建 base LV
 
-交互式或全参数配置 base project，并**立即创建** LVM 基础设施：池/VG/LV/格式化/填充内容。支持 `--sync-type` 选择 repo/git 同步方式。
+交互式或全参数配置 base project，并**立即创建** base LV：格式化 + 填充内容。支持 `--sync-type` 选择 repo/git 同步方式。
+
+前提：LVM 磁盘已通过 `init` 创建。
 
 交互模式下会询问是否设为默认项目（写入 `global.default_base`）。
 
@@ -243,7 +245,8 @@ python3 src/main.py compile --base <project_name>
 
 每个命令有明确职责，无懒加载。用户需按正确顺序调用命令：
 
-- **`link`** → 创建 LVM 基础设施（池/VG/LV/格式化/填充）
+- **`init`** → 创建 LVM 磁盘基础设施（pool image/loop device/VG/thin pool）
+- **`link`** → 创建 base LV + 格式化 + 填充内容（前提：`init` 已创建磁盘）
 - **`create`** → 创建快照 LV（前提：base LV 已通过 `link` 创建）
 - **`mount`** → 激活 LV + 挂载 + 修复权限（前提：LV 已存在）
 - **`activate`** = `mount` + 启动容器
@@ -399,3 +402,7 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 ### 无 workspace 时操作 base LV
 
 用户经常需要直接操作 base LV（查看源码、手动编译等），之前必须创建一个 workspace。解决：`mount`/`unmount`/`activate`/`deactivate`/`enter` 的 `workspace_name` 改为可选，不传时操作 base LV 本身，容器名为 `{project}_default`。
+
+### init 创建 LVM 磁盘
+
+原方案中 `init` 只写配置文件，LVM 磁盘（pool image/loop device/VG/thin pool）的创建延迟到 `link` 中执行。这导致 `link` 职责过重，且用户无法在 `link` 之前确认磁盘基础设施是否就绪。解决：将 LVM 磁盘创建移到 `init` 命令中，`init` 保存配置后立即调用 `_ensure_pool_and_vg()` 创建磁盘基础设施。`link` 只负责创建 base LV + 格式化 + 填充内容。典型工作流变为 `init` → `link` → `create` → `activate`。

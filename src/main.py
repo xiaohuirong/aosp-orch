@@ -388,6 +388,10 @@ def init(ctx, mode, workdir, pool_image_size_gb):
     config.setdefault("base_projects", [])
 
     save_config(config, config_path)
+
+    # Create LVM disk infrastructure: pool image, loop device, VG, thin pool
+    _ensure_pool_and_vg(config)
+
     click.echo(f"\n配置已保存到 {config_path}")
     click.echo("  mode            = %s" % g["mode"])
     click.echo("  workdir         = %s" % g["workdir"])
