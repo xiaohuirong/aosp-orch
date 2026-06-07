@@ -792,9 +792,11 @@ def enter(ctx, workspace_name, base):
     if workspace_name is None:
         c_name = container_name(project_name, "default")
         if not docker_container_exists(c_name):
-            click.echo(f"Base LV '{base}' 未激活，请先运行 'activate --base {base}'。", err=True)
-            sys.exit(1)
-        os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
+            if click.confirm(f"Base LV '{base}' 未激活，是否立即激活?", default=True):
+                ctx.invoke(activate, workspace_name=None, base=base)
+            else:
+                sys.exit(1)
+        os.execvp("docker", ["docker", "exec", "-it", container_name(project_name, "default"), "/bin/sh"])
         return
 
     ws = get_workspace(bp, workspace_name)
@@ -803,8 +805,10 @@ def enter(ctx, workspace_name, base):
         sys.exit(1)
 
     if not _is_workspace_active(base, workspace_name):
-        click.echo(f"Workspace '{workspace_name}' 未激活，请先运行 'activate {workspace_name} --base {base}'。", err=True)
-        sys.exit(1)
+        if click.confirm(f"Workspace '{workspace_name}' 未激活，是否立即激活?", default=True):
+            ctx.invoke(activate, workspace_name=workspace_name, base=base)
+        else:
+            sys.exit(1)
 
     c_name = container_name(bp["name"], workspace_name)
     os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
