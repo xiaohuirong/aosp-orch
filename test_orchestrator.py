@@ -260,11 +260,24 @@ def _force_cleanup_all():
 
 # ── Test Cases ────────────────────────────────────────────────
 
-class TestAssertion1Initialization:
-    """断言 1: 初始化验证（link 只写配置，activate 懒加载触发 LVM 操作）"""
+def _link_xxx(config_path: str):
+    """Helper: link the xxx base project (creates LVM infrastructure)."""
+    result = run_cli(config_path,
+        "link", "--name", "xxx",
+        "--repo-url", "https://github.com/mock/manifest.git",
+        "--repo-branch", "main",
+        "--docker-image", "aosp-builder:mock",
+        "--base-lv-size-gb", "1",
+        "--sync-type", "repo",
+    )
+    assert result.returncode == 0, f"link failed: {result.stderr}"
 
-    def test_link_writes_config(self, mock_config_path):
-        """After link, config must contain the base project."""
+
+class TestAssertion1Initialization:
+    """断言 1: 初始化验证（link 创建 LVM 基础设施，create 创建快照，activate 挂载+启动容器）"""
+
+    def test_link_writes_config_and_creates_infrastructure(self, mock_config_path):
+        """After link, config must contain the base project and LVM infrastructure must exist."""
         result = run_cli(mock_config_path,
             "link", "--name", "xxx",
             "--repo-url", "https://github.com/mock/manifest.git",
@@ -288,30 +301,32 @@ class TestAssertion1Initialization:
         assert "lvm_vg_name" not in raw, "lvm_vg_name should be hardcoded, not stored in config"
         assert "thin_pool_name" not in raw, "thin_pool_name should be hardcoded, not stored in config"
 
-    def test_activate_creates_pool_image(self, mock_config_path):
-        """After activate (lazy), pool image must exist under workdir."""
-        run_cli(mock_config_path, "create", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
-        assert result.returncode == 0, f"activate failed: {result.stderr}"
-        config = read_config(mock_config_path)
+        # Verify LVM infrastructure created by link
+        assert vg_exists(VG_NAME), f"VG {VG_NAME} not created by link"
+        assert lv_exists(VG_NAME, _base_lv_name("xxx")), "Base LV not created by link"
+
+        # Verify pool image exists
         pool_image = _pool_image_path(config)
-        assert os.path.exists(pool_image), f"Pool image {pool_image} not created"
+        assert os.path.exists(pool_image), f"Pool image {pool_image} not created by link"
 
-    def test_activate_creates_vg_and_base_lv_with_mock_output(self, mock_config_path):
-        """After activate (lazy), VG must be active and base LV must contain mock_system.img."""
-        run_cli(mock_config_path, "create", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
-        assert result.returncode == 0, f"activate failed: {result.stderr}"
-
-        # VG must exist
-        assert vg_exists(VG_NAME), f"VG {VG_NAME} not active"
+    def test_link_creates_base_lv_with_mock_output(self, mock_config_path):
+        """After link, base LV must contain mock_system.img."""
+        result = run_cli(mock_config_path,
+            "link", "--name", "xxx",
+            "--repo-url", "https://github.com/mock/manifest.git",
+            "--repo-branch", "main",
+            "--docker-image", "aosp-builder:mock",
+            "--base-lv-size-gb", "1",
+            "--sync-type", "repo",
+        )
+        assert result.returncode == 0, f"link failed: {result.stderr}"
 
         # Base LV must contain mock content - mount it to verify
         config = read_config(mock_config_path)
         base_lv_name = _base_lv_name("xxx")
         base_mount_path = _base_mount_path(config, "xxx")
 
-        # The base LV may be unmounted after activate (snapshot is mounted instead)
+        # The base LV should be unmounted after link — mount to verify content
         if not is_lv_mounted(VG_NAME, base_lv_name):
             from storage import activate_lv
             activate_lv(VG_NAME, base_lv_name)
@@ -334,6 +349,7 @@ class TestAssertion2SnapshotIsolation:
 
     def test_workspace_isolation(self, mock_config_path):
         """Files in workspace A must not be visible in workspace B."""
+        _link_xxx(mock_config_path)
         # Create and activate workspace a
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
@@ -365,6 +381,7 @@ class TestAssertion3DeactivationIdempotency:
 
     def test_deactivate_unmounts_and_removes_container(self, mock_config_path):
         """After deactivate, snapshot LV must be unmounted and container removed."""
+        _link_xxx(mock_config_path)
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
@@ -392,6 +409,7 @@ class TestAssertion4ForceSync:
 
     def test_sync_destroys_workspaces_and_refreshes_base(self, mock_config_path):
         """sync --base must destroy all workspace snapshots and refresh base."""
+        _link_xxx(mock_config_path)
         # Setup: create + activate a and b
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
@@ -422,13 +440,14 @@ class TestAssertion4ForceSync:
         assert "a" in ws_names and "b" in ws_names, \
             "Workspaces should still exist in config after sync"
 
-        # Re-activate b to verify lazy reload
+        # Re-create b (snapshot was destroyed by sync, config entry kept) then activate
+        run_cli(mock_config_path, "create", "b", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
-        # Assert: s-b is recreated (lazy load)
+        # Assert: s-b is recreated
         assert lv_exists(VG_NAME, _snapshot_lv_name("b")), \
-            "s-b not recreated on activate after sync"
+            "s-b not recreated on create+activate after sync"
 
         # Assert: b is in clean state (no dirty.txt from before)
         result = docker_exec("aosp_xxx_b", "ls /xxx/dirty.txt 2>&1; echo EXIT_CODE=$?")
@@ -441,6 +460,7 @@ class TestSnapshotSpaceSaving:
 
     def test_snapshot_data_percent_is_low(self, mock_config_path):
         """A freshly created snapshot should have very low data_percent (space saving)."""
+        _link_xxx(mock_config_path)
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
@@ -451,6 +471,7 @@ class TestSnapshotSpaceSaving:
 
     def test_snapshot_only_stores_deltas(self, mock_config_path):
         """Writing to a workspace should increase data_percent."""
+        _link_xxx(mock_config_path)
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
@@ -473,6 +494,7 @@ class TestSnapshotSpaceSaving:
 
     def test_multiple_snapshots_share_base(self, mock_config_path):
         """Multiple workspaces should share the base data, not duplicate it."""
+        _link_xxx(mock_config_path)
         run_cli(mock_config_path, "create", "a", "--base", "xxx")
         run_cli(mock_config_path, "activate", "a", "--base", "xxx")
 
@@ -489,8 +511,22 @@ class TestSnapshotSpaceSaving:
 class TestGitSync:
     """验证 git sync 模式：git clone 到 git-repo 子目录，git pull 增量更新。"""
 
+    def _link_aosp(self, config_path: str):
+        """Helper: link the aosp base project for git tests."""
+        result = run_cli(config_path,
+            "link", "--name", "aosp",
+            "--repo-url", "https://github.com/xiaohuirong/txt2sub",
+            "--repo-branch", "main",
+            "--docker-image", "alpine/git",
+            "--base-lv-size-gb", "1",
+            "--sync-type", "git",
+        )
+        assert result.returncode == 0, f"link failed: {result.stderr}"
+
     def test_git_clone_to_git_repo_dir(self, prod_config_path):
         """activate should git clone into /{project}/git-repo directory."""
+        self._link_aosp(prod_config_path)
+        run_cli(prod_config_path, "create", "feature-a", "--base", "aosp")
         result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
@@ -506,7 +542,9 @@ class TestGitSync:
 
     def test_git_pull_on_reactivate(self, prod_config_path):
         """Re-activating after sync should git pull instead of git clone."""
+        self._link_aosp(prod_config_path)
         # First activate: git clone
+        run_cli(prod_config_path, "create", "feature-a", "--base", "aosp")
         result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"first activate failed: {result.stderr}"
 

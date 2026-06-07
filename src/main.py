@@ -203,14 +203,13 @@ def container_name(base_project_name: str, ws_name: str) -> str:
 
 # ── LVM / Pool helpers ───────────────────────────────────────
 
-def ensure_pool_and_vg(config: dict) -> str | None:
-    """Ensure the LVM pool and VG exist. Returns loop device path or None if already set up."""
+def _ensure_pool_and_vg(config: dict) -> None:
+    """Create pool image, loop device, VG, and thin pool if they don't exist."""
     pool_image_path = _pool_image_path(config)
     pool_size_gb = config["global"]["pool_image_size_gb"]
 
     if vg_exists(VG_NAME):
-        logger.info("VG '%s' already exists", VG_NAME)
-        return None
+        return
 
     # Create pool image
     if not os.path.exists(pool_image_path):
@@ -224,30 +223,19 @@ def ensure_pool_and_vg(config: dict) -> str | None:
 
     # Initialize LVM thin pool
     init_lvm_thin_pool(loop_dev, VG_NAME, THIN_POOL_NAME)
-    return loop_dev
 
 
 def _run_sync(c_name: str, bp: dict) -> None:
-    """Run sync commands inside a container based on project's sync_type.
-
-    sync_type: "repo" (default) or "git"
-    - repo: repo init -u <url> -b <branch> && repo sync
-    - git:
-      - if .git exists: git pull
-      - if git pull fails: ask user to clear and re-clone or skip
-      - if .git not exists: git clone -b <branch> <url> <project_name>
-    """
+    """Run sync commands inside a container based on project's sync_type."""
     sync_type = bp.get("sync_type", "repo")
     project_dir = bp["name"]
     repo_url = bp["repo_url"]
     repo_branch = bp["repo_branch"]
 
     if sync_type == "git":
-        # Git repo lives in /{project_dir}/git-repo, mount point is /{project_dir}
         git_repo_dir = f"/{project_dir}/git-repo"
         check = docker_exec(c_name, f"test -d {git_repo_dir}/.git && echo EXISTS || echo MISSING")
         if "EXISTS" in check.stdout:
-            # Try git pull first
             result = docker_exec(c_name, f"cd {git_repo_dir} && git pull", check=False)
             if result.returncode != 0:
                 click.echo(f"git pull 失败: {result.stderr}")
@@ -257,23 +245,17 @@ def _run_sync(c_name: str, bp: dict) -> None:
                 else:
                     click.echo("跳过同步，继续后续操作。")
         else:
-            # Fresh clone
             docker_exec(c_name, f"git clone -b {repo_branch} {repo_url} {git_repo_dir}")
     else:
-        # Default: repo
         docker_exec(c_name, f"cd /{project_dir} && repo init -u {repo_url} -b {repo_branch}")
         docker_exec(c_name, f"cd /{project_dir} && repo sync")
 
 
-def _ensure_base_lv(config: dict, bp: dict) -> None:
-    """Lazy-init: ensure pool, VG, base LV exist, are formatted, and populated.
+def _populate_base(config: dict, bp: dict) -> None:
+    """Populate base LV with content (mount, fill, unmount).
 
-    This is the core lazy-load logic called by activate/sync/compile when they
-    discover the base infrastructure is missing.
-
-    Optimization: only mounts the base LV when first-time population is needed.
-    If the base LV already exists and is initialized, we skip the mount/unmount
-    cycle entirely — snapshots are taken from the unmounted base for consistency.
+    Base LV must already exist and be formatted. This function mounts it,
+    populates it based on mode, writes the marker, and unmounts it.
     """
     mode = config["global"]["mode"]
     project_name = bp["name"]
@@ -281,62 +263,40 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
     base_mount_path = _base_mount_path(config, project_name)
     docker_image = bp["docker_image"]
 
-    # 1. Ensure pool and VG
-    ensure_pool_and_vg(config)
+    # Mount base LV
+    activate_lv(VG_NAME, base_lv_name)
+    os.makedirs(base_mount_path, exist_ok=True)
+    mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
 
-    # 2. Create base LV if not exists
-    if not lv_exists(VG_NAME, base_lv_name):
-        create_thin_lv(VG_NAME, THIN_POOL_NAME, base_lv_name, bp["base_lv_size_gb"])
-        format_ext4(f"/dev/{VG_NAME}/{base_lv_name}")
-
-    # 3. Check if population is needed (without mounting if possible)
-    #    If base LV exists and is not mounted, we need to mount briefly to check marker.
-    #    If base LV is already mounted (e.g. from a previous interrupted run), check directly.
-    needs_populate = False
-    was_already_mounted = is_lv_mounted(VG_NAME, base_lv_name)
-
-    if was_already_mounted:
-        # Already mounted — check marker directly
-        marker = os.path.join(base_mount_path, ".aosp_base_initialized")
-        needs_populate = not os.path.exists(marker)
+    # Populate
+    if mode == "mock":
+        if not docker_image_exists(docker_image):
+            docker_build_mock(docker_image)
+        mock_populate_base(base_mount_path)
     else:
-        # Not mounted — we must mount to check if population is needed
-        activate_lv(VG_NAME, base_lv_name)
-        os.makedirs(base_mount_path, exist_ok=True)
-        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
-        _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
-        marker = os.path.join(base_mount_path, ".aosp_base_initialized")
-        needs_populate = not os.path.exists(marker)
-
-    # 4. Populate if empty (first-time setup)
-    if needs_populate:
-        if mode == "mock":
-            if not docker_image_exists(docker_image):
-                docker_build_mock(docker_image)
-            mock_populate_base(base_mount_path)
-        else:
-            build_config = bp.get("build_config", {})
-            c_name = container_name(project_name, "default")
-            if docker_container_exists(c_name):
-                docker_rm(c_name)
-            docker_run(c_name, base_mount_path, f"/{project_name}", docker_image)
-            _run_sync(c_name, bp)
-            for cmd in build_config.get("setup_commands", []):
-                docker_exec(c_name, f"cd /{project_name} && {cmd}")
-            compile_cmd = build_config.get("compile_command", "")
-            env_vars = build_config.get("env_vars", {})
-            env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
-            if compile_cmd:
-                docker_exec(c_name, f"cd /{project_name} && {env_str} {compile_cmd}")
+        build_config = bp.get("build_config", {})
+        c_name = container_name(project_name, "default")
+        if docker_container_exists(c_name):
             docker_rm(c_name)
-        # Write marker
-        with open(marker, "w") as f:
-            f.write("initialized")
+        docker_run(c_name, base_mount_path, f"/{project_name}", docker_image)
+        _run_sync(c_name, bp)
+        for cmd in build_config.get("setup_commands", []):
+            docker_exec(c_name, f"cd /{project_name} && {cmd}")
+        compile_cmd = build_config.get("compile_command", "")
+        env_vars = build_config.get("env_vars", {})
+        env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
+        if compile_cmd:
+            docker_exec(c_name, f"cd /{project_name} && {env_str} {compile_cmd}")
+        docker_rm(c_name)
 
-    # 5. Unmount base LV if we mounted it (snapshots must be taken from unmounted base
-    #    for filesystem consistency — crash-consistent snapshots are not guaranteed)
-    if not was_already_mounted and is_lv_mounted(VG_NAME, base_lv_name):
-        umount(base_mount_path)
+    # Write marker
+    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+    with open(marker, "w") as f:
+        f.write("initialized")
+
+    # Unmount base LV (snapshots must be taken from unmounted base for consistency)
+    umount(base_mount_path)
 
 
 # ── Internal helpers for workspace cleanup ──────────────────
@@ -450,7 +410,7 @@ def init(ctx, mode, workdir, pool_image_size_gb):
               help="代码同步方式: repo (默认) | git")
 @click.pass_context
 def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type):
-    """交互式或参数化配置 base project（仅写配置，不触发 LVM 操作）。"""
+    """配置 base project 并创建 LVM 基础设施（池/VG/LV/格式化/填充）。"""
     config_path = ctx.obj["config_path"]
 
     # Load or create config
@@ -473,14 +433,11 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
     all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type])
 
     if all_provided:
-        # Non-interactive: use provided values
         bp_name = name
     else:
-        # Interactive mode
         click.echo("=== 配置 Base Project ===")
         click.echo("（括号内为当前值/默认值，直接回车保留）\n")
 
-        # List existing projects for reference
         existing_names = [bp["name"] for bp in config.get("base_projects", [])]
         if existing_names:
             click.echo(f"已有项目: {', '.join(existing_names)}")
@@ -490,7 +447,6 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
     # Find or create the base project
     bp = get_base_project(config, bp_name)
     if bp is None:
-        # Create new base project entry
         bp = {
             "name": bp_name,
             "repo_url": repo_url or "https://android.googlesource.com/platform/manifest",
@@ -507,7 +463,6 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
         }
         config.setdefault("base_projects", []).append(bp)
     else:
-        # Update existing base project with any provided values
         if repo_url is not None:
             bp["repo_url"] = repo_url
         if repo_branch is not None:
@@ -520,7 +475,6 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
             bp["base_lv_size_gb"] = base_lv_size_gb
 
     if not all_provided:
-        # Interactive: let user review/edit key fields
         bp["repo_url"] = click.prompt("清单仓库地址", default=bp["repo_url"])
         bp["repo_branch"] = click.prompt("清单分支", default=bp["repo_branch"])
         bp.setdefault("sync_type", "repo")
@@ -540,15 +494,34 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
     if is_default:
         g["default_base"] = bp_name
 
-    # Save config only — no LVM operations
+    # Save config
     save_config(config, config_path)
-    # Show auto-derived paths
-    click.echo(f"Base project '{bp_name}' configured.")
+
+    # Create LVM infrastructure: pool, VG, base LV, format, populate
+    base_lv_name = _base_lv_name(bp_name)
+    _ensure_pool_and_vg(config)
+
+    if not lv_exists(VG_NAME, base_lv_name):
+        create_thin_lv(VG_NAME, THIN_POOL_NAME, base_lv_name, bp["base_lv_size_gb"])
+        format_ext4(f"/dev/{VG_NAME}/{base_lv_name}")
+        _populate_base(config, bp)
+    else:
+        # Base LV already exists — check if populated
+        base_mount_path = _base_mount_path(config, bp_name)
+        activate_lv(VG_NAME, base_lv_name)
+        os.makedirs(base_mount_path, exist_ok=True)
+        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
+        marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+        needs_populate = not os.path.exists(marker)
+        umount(base_mount_path)
+        if needs_populate:
+            _populate_base(config, bp)
+
+    click.echo(f"Base project '{bp_name}' linked and initialized.")
     click.echo(f"  base_lv_name    = {_base_lv_name(bp_name)} (自动生成)")
     click.echo(f"  base_mount_path = {_base_mount_path(config, bp_name)} (自动生成)")
     if is_default:
         click.echo(f"  default_base    = {bp_name}")
-    click.echo("Run 'activate' to materialize.")
 
 
 @cli.command()
@@ -556,7 +529,7 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def create(ctx, workspace_name, base):
-    """Create a lightweight workspace (metadata only)."""
+    """创建工作区：写配置 + 创建快照 LV。幂等：workspace 已存在但快照不存在时仅创建快照。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -565,15 +538,24 @@ def create(ctx, workspace_name, base):
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
 
-    if get_workspace(bp, workspace_name) is not None:
-        click.echo(f"Workspace '{workspace_name}' already exists in '{base}'", err=True)
+    ws_exists = get_workspace(bp, workspace_name) is not None
+
+    # Check base LV exists
+    base_lv_name = _base_lv_name(base)
+    if not lv_exists(VG_NAME, base_lv_name):
+        click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
         sys.exit(1)
 
-    new_ws = {
-        "name": workspace_name,
-    }
-    bp.setdefault("workspaces", []).append(new_ws)
-    save_config(config, config_path)
+    # Create snapshot LV if not exists
+    snapshot_lv_name = _snapshot_lv_name(workspace_name)
+    if not lv_exists(VG_NAME, snapshot_lv_name):
+        create_snapshot(VG_NAME, base_lv_name, snapshot_lv_name)
+
+    # Write config if workspace doesn't exist yet
+    if not ws_exists:
+        new_ws = {"name": workspace_name}
+        bp.setdefault("workspaces", []).append(new_ws)
+        save_config(config, config_path)
     mount_path = _workspace_mount_path(config, base, workspace_name)
     click.echo(f"Workspace '{workspace_name}' created.")
     click.echo(f"  snapshot_lv_name = {_snapshot_lv_name(workspace_name)} (自动生成)")
@@ -585,7 +567,7 @@ def create(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def mount_cmd(ctx, workspace_name, base):
-    """挂载工作区快照。不指定 workspace 时挂载 base LV。"""
+    """挂载工作区快照。不指定 workspace 时挂载 base LV。前提：LV 已存在。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -599,8 +581,10 @@ def mount_cmd(ctx, workspace_name, base):
 
     if workspace_name is None:
         # Mount base LV directly
-        _ensure_base_lv(config, bp)
         base_lv_name = _base_lv_name(project_name)
+        if not lv_exists(VG_NAME, base_lv_name):
+            click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
+            sys.exit(1)
         base_mount_path = _base_mount_path(config, project_name)
         activate_lv(VG_NAME, base_lv_name)
         os.makedirs(base_mount_path, exist_ok=True)
@@ -612,28 +596,18 @@ def mount_cmd(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
-            sys.exit(0)
-        ws = {"name": workspace_name}
-        bp.setdefault("workspaces", []).append(ws)
-        save_config(config, config_path)
-        click.echo(f"Workspace '{workspace_name}' created.")
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        sys.exit(1)
 
-    base_lv_name = _base_lv_name(project_name)
     snapshot_lv_name = _snapshot_lv_name(workspace_name)
+    if not lv_exists(VG_NAME, snapshot_lv_name):
+        click.echo(f"Snapshot LV '{snapshot_lv_name}' 不存在，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        sys.exit(1)
+
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
 
-    # Lazy: ensure base LV exists and is populated
-    _ensure_base_lv(config, bp)
-
-    # Lazy snapshot: create if not exists
-    if not lv_exists(VG_NAME, snapshot_lv_name):
-        create_snapshot(VG_NAME, base_lv_name, snapshot_lv_name)
-
-    # Ensure snapshot LV is activated
+    # Activate and mount snapshot
     activate_lv(VG_NAME, snapshot_lv_name)
-
-    # Mount snapshot
     os.makedirs(mount_path, exist_ok=True)
     if not is_lv_mounted(VG_NAME, snapshot_lv_name):
         mount(f"/dev/{VG_NAME}/{snapshot_lv_name}", mount_path)
@@ -662,7 +636,6 @@ def unmount_cmd(ctx, workspace_name, base):
     project_name = bp["name"]
 
     if workspace_name is None:
-        # Unmount base LV
         base_lv_name = _base_lv_name(project_name)
         base_mount_path = _base_mount_path(config, project_name)
         if not is_mounted(base_mount_path) and not is_lv_mounted(VG_NAME, base_lv_name):
@@ -696,10 +669,9 @@ def unmount_cmd(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def activate(ctx, workspace_name, base):
-    """Activate a workspace (mount + start container).
+    """激活工作区（mount + 启动容器）。不指定 workspace 时激活 base LV。
 
-    Auto-creates the workspace if it doesn't exist yet.
-    不指定 workspace 时挂载 base LV 并启动 default 容器。
+    前提：workspace 已 create，base LV 已 link。
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -728,13 +700,8 @@ def activate(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        # Auto-create workspace if not exists
-        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
-            sys.exit(0)
-        ws = {"name": workspace_name}
-        bp.setdefault("workspaces", []).append(ws)
-        save_config(config, config_path)
-        click.echo(f"Workspace '{workspace_name}' created.")
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        sys.exit(1)
 
     if _is_workspace_active(base, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already active.")
@@ -742,7 +709,7 @@ def activate(ctx, workspace_name, base):
 
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
 
-    # Mount (lazy snapshot + mount)
+    # Mount
     ctx.invoke(mount_cmd, workspace_name=workspace_name, base=base)
 
     # Start container
@@ -761,10 +728,9 @@ def activate(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def enter(ctx, workspace_name, base):
-    """Enter a workspace container interactively.
+    """进入工作区容器。不指定 workspace 时进入 base LV 的 default 容器。
 
-    Auto-activates the workspace if not yet active.
-    不指定 workspace 时进入 base LV 的 default 容器。
+    前提：workspace 已 activate。
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -778,28 +744,21 @@ def enter(ctx, workspace_name, base):
     project_name = bp["name"]
 
     if workspace_name is None:
-        # Enter base LV's default container
         c_name = container_name(project_name, "default")
         if not docker_container_exists(c_name):
-            if not click.confirm(f"Base LV '{base}' 未激活，是否激活?", default=True):
-                sys.exit(0)
-            ctx.invoke(activate, workspace_name=None, base=base)
+            click.echo(f"Base LV '{base}' 未激活，请先运行 'activate --base {base}'。", err=True)
+            sys.exit(1)
         os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
         return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        if not click.confirm(f"Workspace '{workspace_name}' 不存在，是否创建?", default=True):
-            sys.exit(0)
-        ws = {"name": workspace_name}
-        bp.setdefault("workspaces", []).append(ws)
-        save_config(config, config_path)
-        click.echo(f"Workspace '{workspace_name}' created.")
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        sys.exit(1)
 
     if not _is_workspace_active(base, workspace_name):
-        if not click.confirm(f"Workspace '{workspace_name}' 未激活，是否激活?", default=True):
-            sys.exit(0)
-        ctx.invoke(activate, workspace_name=workspace_name, base=base)
+        click.echo(f"Workspace '{workspace_name}' 未激活，请先运行 'activate {workspace_name} --base {base}'。", err=True)
+        sys.exit(1)
 
     c_name = container_name(bp["name"], workspace_name)
     os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
@@ -810,10 +769,7 @@ def enter(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def deactivate(ctx, workspace_name, base):
-    """Deactivate a workspace (stop container + unmount).
-
-    不指定 workspace 时停掉 base LV 的 default 容器并卸载。
-    """
+    """去激活工作区（停容器 + 卸载）。不指定 workspace 时去激活 base LV。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -826,7 +782,6 @@ def deactivate(ctx, workspace_name, base):
     project_name = bp["name"]
 
     if workspace_name is None:
-        # Deactivate base LV: stop default container + unmount
         c_name = container_name(project_name, "default")
         if docker_container_exists(c_name):
             docker_rm(c_name)
@@ -859,7 +814,7 @@ def deactivate(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def remove(ctx, workspace_name, base):
-    """Remove a workspace entirely (deactivate + destroy snapshot)."""
+    """彻底销毁工作区（deactivate + 销毁快照 + 删配置）。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -902,7 +857,7 @@ def remove(ctx, workspace_name, base):
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def sync(ctx, base):
-    """Force re-sync and re-compile the base (destroys all workspaces)."""
+    """基底强制更新（清盘流）：销毁所有工作区快照 + 重新填充 base LV。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -914,29 +869,31 @@ def sync(ctx, base):
         sys.exit(1)
 
     project_name = bp["name"]
+    base_lv_name = _base_lv_name(project_name)
     base_mount_path = _base_mount_path(config, project_name)
     docker_image = bp["docker_image"]
 
     # 1. Destroy all workspace snapshots and containers (keep config entries)
     _destroy_all_workspaces(config, bp)
 
-    # 2. Ensure base LV exists (lazy) — this leaves base LV unmounted
-    _ensure_base_lv(config, bp)
+    # 2. Check base LV exists
+    if not lv_exists(VG_NAME, base_lv_name):
+        click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
+        sys.exit(1)
 
-    # 3. Mount base LV for re-population
-    base_lv_name = _base_lv_name(project_name)
+    # 3. Mount base LV, remove marker, re-populate
     activate_lv(VG_NAME, base_lv_name)
     os.makedirs(base_mount_path, exist_ok=True)
     if not is_lv_mounted(VG_NAME, base_lv_name):
         mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
     _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
 
-    # 4. Remove initialization marker to force re-populate
+    # Remove initialization marker to force re-populate
     marker = os.path.join(base_mount_path, ".aosp_base_initialized")
     if os.path.exists(marker):
         os.remove(marker)
 
-    # 5. Re-populate
+    # Re-populate
     if mode == "mock":
         if not docker_image_exists(docker_image):
             docker_build_mock(docker_image)
@@ -961,7 +918,7 @@ def sync(ctx, base):
     with open(marker, "w") as f:
         f.write("initialized")
 
-    # 6. Unmount base LV (snapshots should be taken from unmounted base)
+    # Unmount base LV
     if is_lv_mounted(VG_NAME, base_lv_name):
         umount(base_mount_path)
     click.echo(f"Base project '{base}' synced successfully.")
@@ -971,7 +928,7 @@ def sync(ctx, base):
 @click.option("--base", default=None, help="Base project 名称 (默认使用 global.default_base)")
 @click.pass_context
 def unlink(ctx, base):
-    """删除 base project 配置（销毁所有工作区 + 删除配置条目）。"""
+    """删除 base project（销毁所有工作区 + 销毁 base LV + 删除配置条目）。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
