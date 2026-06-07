@@ -2,6 +2,7 @@ global:
   mode: mock
   workdir: /tmp/aosp_workspaces
   pool_image_size_gb: 2
+  default_base: xxx
 base_projects:
 - name: xxx
   repo_url: https://github.com/mock/manifest.git

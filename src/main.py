@@ -136,6 +136,20 @@ def validate_config(config: dict) -> list[str]:
     return errors
 
 
+def _resolve_base(config: dict, base: str | None) -> str:
+    """Resolve base project name: --base param > global.default_base.
+
+    Exits with error if neither is set.
+    """
+    if base is not None:
+        return base
+    default_base = config.get("global", {}).get("default_base")
+    if default_base:
+        return default_base
+    click.echo("未指定 --base 参数，且未设置 global.default_base。请使用 --base 或先 link 一个项目并设为默认。", err=True)
+    sys.exit(1)
+
+
 def load_and_validate_config(config_path: str) -> dict:
     """Load config and validate. Exits with error if invalid."""
     if not os.path.exists(config_path):
@@ -400,6 +414,9 @@ def init(ctx, mode, workdir, pool_image_size_gb):
     click.echo("  pool_image_size = %d GB" % g["pool_image_size_gb"])
     click.echo(f"  lvm_vg_name     = {VG_NAME} (硬编码)")
     click.echo(f"  thin_pool_name  = {THIN_POOL_NAME} (硬编码)")
+    default_base = g.get("default_base")
+    if default_base:
+        click.echo(f"  default_base    = {default_base}")
 
 
 @cli.command()
@@ -490,23 +507,38 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
 
+    # Ask if this should be the default base project
+    current_default = g.get("default_base")
+    if current_default == bp_name:
+        is_default = True
+    elif all_provided:
+        is_default = False
+    else:
+        is_default = click.confirm(f"是否将 '{bp_name}' 设为默认项目?", default=True)
+
+    if is_default:
+        g["default_base"] = bp_name
+
     # Save config only — no LVM operations
     save_config(config, config_path)
     # Show auto-derived paths
     click.echo(f"Base project '{bp_name}' configured.")
     click.echo(f"  base_lv_name    = {_base_lv_name(bp_name)} (自动生成)")
     click.echo(f"  base_mount_path = {_base_mount_path(config, bp_name)} (自动生成)")
+    if is_default:
+        click.echo(f"  default_base    = {bp_name}")
     click.echo("Run 'activate' to materialize.")
 
 
 @cli.command()
 @click.argument("workspace_name")
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def create(ctx, workspace_name, base):
     """Create a lightweight workspace (metadata only)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
@@ -529,7 +561,7 @@ def create(ctx, workspace_name, base):
 
 @cli.command()
 @click.argument("workspace_name")
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def activate(ctx, workspace_name, base):
     """Activate a workspace (lazy snapshot + mount + container).
@@ -538,6 +570,7 @@ def activate(ctx, workspace_name, base):
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
 
     bp = get_base_project(config, base)
     if bp is None:
@@ -597,7 +630,7 @@ def activate(ctx, workspace_name, base):
 
 @cli.command()
 @click.argument("workspace_name")
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def enter(ctx, workspace_name, base):
     """Enter a workspace container interactively.
@@ -606,6 +639,7 @@ def enter(ctx, workspace_name, base):
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
 
     bp = get_base_project(config, base)
     if bp is None:
@@ -632,12 +666,13 @@ def enter(ctx, workspace_name, base):
 
 @cli.command()
 @click.argument("workspace_name")
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def deactivate(ctx, workspace_name, base):
     """Deactivate a workspace (stop container + unmount)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
 
     bp = get_base_project(config, base)
     if bp is None:
@@ -669,12 +704,13 @@ def deactivate(ctx, workspace_name, base):
 
 @cli.command()
 @click.argument("workspace_name")
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def remove(ctx, workspace_name, base):
     """Remove a workspace entirely (deactivate + destroy snapshot)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
 
     bp = get_base_project(config, base)
     if bp is None:
@@ -714,12 +750,13 @@ def remove(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def sync(ctx, base):
     """Force re-sync and re-compile the base (destroys all workspaces)."""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
     mode = config["global"]["mode"]
 
     bp = get_base_project(config, base)
@@ -793,10 +830,13 @@ def sync(ctx, base):
 
 
 @cli.command()
-@click.option("--base", required=True, help="Base project name")
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def compile(ctx, base):
     """Alias for sync - re-compile the base."""
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
     ctx.invoke(sync, base=base)
 
 
