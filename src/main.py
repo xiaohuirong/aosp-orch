@@ -339,6 +339,27 @@ def _ensure_base_lv(config: dict, bp: dict) -> None:
         umount(base_mount_path)
 
 
+# ── Internal helpers for workspace cleanup ──────────────────
+
+def _destroy_all_workspaces(config: dict, bp: dict) -> None:
+    """Destroy all workspace containers, mounts, and snapshot LVs.
+
+    Used by sync and unlink. Does NOT remove config entries.
+    """
+    base = bp["name"]
+    for ws in list(bp.get("workspaces", [])):
+        ws_name = ws["name"]
+        c_name = container_name(base, ws_name)
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        ws_mount_path = _workspace_mount_path(config, base, ws_name)
+        if is_mounted(ws_mount_path):
+            umount(ws_mount_path)
+        snapshot_lv_name = _snapshot_lv_name(ws_name)
+        if lv_exists(VG_NAME, snapshot_lv_name):
+            remove_lv(VG_NAME, snapshot_lv_name)
+
+
 # ── CLI Commands ──────────────────────────────────────────────
 
 @click.group()
@@ -792,12 +813,9 @@ def remove(ctx, workspace_name, base):
 
     # 1. Deactivate if active
     if _is_workspace_active(base, workspace_name):
-        c_name = container_name(bp["name"], workspace_name)
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        mount_path = _workspace_mount_path(config, bp["name"], workspace_name)
-        if is_mounted(mount_path):
-            umount(mount_path)
+        ctx.invoke(deactivate, workspace_name=workspace_name, base=base)
+    elif is_mounted(_workspace_mount_path(config, bp["name"], workspace_name)):
+        ctx.invoke(unmount_cmd, workspace_name=workspace_name, base=base)
 
     # 2. Destroy snapshot LV
     snapshot_lv_name = _snapshot_lv_name(workspace_name)
@@ -830,18 +848,7 @@ def sync(ctx, base):
     docker_image = bp["docker_image"]
 
     # 1. Destroy all workspace snapshots and containers (keep config entries)
-    workspaces = list(bp.get("workspaces", []))
-    for ws in workspaces:
-        ws_name = ws["name"]
-        c_name = container_name(base, ws_name)
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        ws_mount_path = _workspace_mount_path(config, base, ws_name)
-        if is_mounted(ws_mount_path):
-            umount(ws_mount_path)
-        snapshot_lv_name = _snapshot_lv_name(ws_name)
-        if lv_exists(VG_NAME, snapshot_lv_name):
-            remove_lv(VG_NAME, snapshot_lv_name)
+    _destroy_all_workspaces(config, bp)
 
     # 2. Ensure base LV exists (lazy) — this leaves base LV unmounted
     _ensure_base_lv(config, bp)
@@ -905,17 +912,7 @@ def unlink(ctx, base):
         sys.exit(1)
 
     # 1. Destroy all workspace snapshots and containers
-    for ws in list(bp.get("workspaces", [])):
-        ws_name = ws["name"]
-        c_name = container_name(base, ws_name)
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        ws_mount_path = _workspace_mount_path(config, base, ws_name)
-        if is_mounted(ws_mount_path):
-            umount(ws_mount_path)
-        snapshot_lv_name = _snapshot_lv_name(ws_name)
-        if lv_exists(VG_NAME, snapshot_lv_name):
-            remove_lv(VG_NAME, snapshot_lv_name)
+    _destroy_all_workspaces(config, bp)
 
     # 2. Destroy base LV
     base_lv_name = _base_lv_name(base)
