@@ -625,8 +625,11 @@ def new_cmd(ctx, workspace_name, base):
     # Check base LV exists
     base_lv_name = _base_lv_name(base)
     if not lv_exists(VG_NAME, base_lv_name):
-        click.echo(f"Base LV '{base}' 不存在，请先运行 'add --name {base}'。", err=True)
-        sys.exit(1)
+        click.echo(f"Base LV '{base}' 不存在，正在创建...")
+        _ensure_pool_and_vg(config)
+        create_thin_lv(VG_NAME, THIN_POOL_NAME, base_lv_name, bp["base_lv_size_gb"])
+        format_ext4(f"/dev/{VG_NAME}/{base_lv_name}")
+        _populate_base(config, bp)
 
     # Create snapshot LV if not exists
     snapshot_lv_name = _snapshot_lv_name(workspace_name)
