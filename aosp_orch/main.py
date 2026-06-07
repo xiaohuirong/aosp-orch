@@ -139,14 +139,14 @@ def _resolve_base(config: dict, base: str | None) -> str:
     default_base = config.get("global", {}).get("default_base")
     if default_base:
         return default_base
-    click.echo("未指定 --base 参数，且未设置 global.default_base。请使用 --base 或先 link 一个项目并设为默认。", err=True)
+    click.echo("未指定 --base 参数，且未设置 global.default_base。请使用 --base 或先 add 一个项目并设为默认。", err=True)
     sys.exit(1)
 
 
 def load_and_validate_config(config_path: str) -> dict:
     """Load config and validate. Exits with error if invalid."""
     if not os.path.exists(config_path):
-        click.echo(f"配置文件不存在: {config_path}\n请先运行 'init' 或 'link' 命令创建配置。", err=True)
+        click.echo(f"配置文件不存在: {config_path}\n请先运行 'init' 或 'add' 命令创建配置。", err=True)
         sys.exit(1)
     config = load_config(config_path)
     errors = validate_config(config)
@@ -184,8 +184,8 @@ def get_workspace(base_project: dict, ws_name: str) -> dict | None:
     return None
 
 
-def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict]:
-    """Load config, resolve base, and get base project. Returns (config, bp).
+def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict, str]:
+    """Load config, resolve base, and get base project. Returns (config, bp, base).
 
     Exits with error if config invalid or base project not found.
     """
@@ -196,7 +196,7 @@ def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict]:
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
-    return config, bp
+    return config, bp, base
 
 
 def _mount_lv(lv_name: str, mount_path: str) -> None:
@@ -352,7 +352,7 @@ def _destroy_workspace(config: dict, base: str, ws_name: str) -> None:
 def _destroy_all_workspaces(config: dict, bp: dict) -> None:
     """Destroy all workspace containers, mounts, and snapshot LVs.
 
-    Used by sync and unlink. Does NOT remove config entries.
+    Used by sync and remove. Does NOT remove config entries.
     """
     base = bp["name"]
     for ws in list(bp.get("workspaces", [])):
@@ -517,7 +517,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
     g = config["global"]
     mode = g["mode"]
 
-    # Check if all link-specific options are provided
+    # Check if all add-specific options are provided
     all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type])
 
     if all_provided:
@@ -618,14 +618,14 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
 @click.pass_context
 def new_cmd(ctx, workspace_name, base):
     """创建工作区：写配置 + 创建快照 LV。幂等：workspace 已存在但快照不存在时仅创建快照。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     ws_exists = get_workspace(bp, workspace_name) is not None
 
     # Check base LV exists
     base_lv_name = _base_lv_name(base)
     if not lv_exists(VG_NAME, base_lv_name):
-        click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
+        click.echo(f"Base LV '{base}' 不存在，请先运行 'add --name {base}'。", err=True)
         sys.exit(1)
 
     # Create snapshot LV if not exists
@@ -650,7 +650,7 @@ def new_cmd(ctx, workspace_name, base):
 @click.pass_context
 def mount_cmd(ctx, workspace_name, base):
     """挂载工作区快照。不指定 workspace 时挂载 base LV。前提：LV 已存在。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -658,7 +658,7 @@ def mount_cmd(ctx, workspace_name, base):
         # Mount base LV directly
         lv_name = _base_lv_name(project_name)
         if not lv_exists(VG_NAME, lv_name):
-            click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
+            click.echo(f"Base LV '{base}' 不存在，请先运行 'add --name {base}'。", err=True)
             sys.exit(1)
         mount_path = _base_mount_path(config, project_name)
         _mount_lv(lv_name, mount_path)
@@ -667,12 +667,12 @@ def mount_cmd(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'new {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
     lv_name = _snapshot_lv_name(workspace_name)
     if not lv_exists(VG_NAME, lv_name):
-        click.echo(f"Snapshot LV '{lv_name}' 不存在，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        click.echo(f"Snapshot LV '{lv_name}' 不存在，请先运行 'new {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
@@ -686,7 +686,7 @@ def mount_cmd(ctx, workspace_name, base):
 @click.pass_context
 def unmount_cmd(ctx, workspace_name, base):
     """卸载工作区快照。不指定 workspace 时卸载 base LV。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -726,9 +726,9 @@ def unmount_cmd(ctx, workspace_name, base):
 def activate(ctx, workspace_name, base):
     """激活工作区（mount + 启动容器）。不指定 workspace 时激活 base LV。
 
-    前提：workspace 已 create，base LV 已 link。
+    前提：workspace 已 new，base LV 已 add。
     """
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
     docker_image = bp["docker_image"]
@@ -743,7 +743,7 @@ def activate(ctx, workspace_name, base):
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
-        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
+        click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'new {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
     if _is_workspace_active(base, workspace_name):
@@ -769,7 +769,7 @@ def enter(ctx, workspace_name, base):
 
     前提：workspace 已 activate。
     """
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -806,7 +806,7 @@ def enter(ctx, workspace_name, base):
 @click.pass_context
 def deactivate(ctx, workspace_name, base):
     """去激活工作区（停容器 + 卸载）。不指定 workspace 时去激活 base LV。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -844,7 +844,7 @@ def deactivate(ctx, workspace_name, base):
 @click.pass_context
 def del_cmd(ctx, workspace_name, base):
     """彻底销毁工作区（deactivate + 销毁快照 + 删配置）。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     ws = None
     ws_idx = None
@@ -880,7 +880,7 @@ def del_cmd(ctx, workspace_name, base):
 @click.pass_context
 def sync(ctx, base):
     """基底强制更新（清盘流）：销毁所有工作区快照 + 重新填充 base LV。"""
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     base_lv_name = _base_lv_name(bp["name"])
 
@@ -889,7 +889,7 @@ def sync(ctx, base):
 
     # 2. Check base LV exists
     if not lv_exists(VG_NAME, base_lv_name):
-        click.echo(f"Base LV '{bp['name']}' 不存在，请先运行 'link --name {bp['name']}'。", err=True)
+        click.echo(f"Base LV '{bp['name']}' 不存在，请先运行 'add --name {bp['name']}'。", err=True)
         sys.exit(1)
 
     # 3. Force re-populate base LV
@@ -980,7 +980,7 @@ def rebase(ctx, workspace_name, base):
 
     不指定 workspace 时删除该 base 下所有 workspace。需二次确认。
     """
-    config, bp = _resolve_bp(ctx, base)
+    config, bp, base = _resolve_bp(ctx, base)
 
     if workspace_name is None:
         # All workspaces
@@ -1005,7 +1005,7 @@ def rebase(ctx, workspace_name, base):
         _destroy_workspace(config, bp["name"], workspace_name)
         click.echo(f"Workspace '{workspace_name}' 已删除。")
 
-    click.echo(f"Base project '{bp['name']}' rebase 完成。下次 create 可重建快照。")
+    click.echo(f"Base project '{bp['name']}' rebase 完成。下次 new 可重建快照。")
 
 
 @cli.command()

@@ -109,7 +109,8 @@ def lv_exists(vg_name: str, lv_name: str) -> bool:
 
 
 def remove_lv(vg_name: str, lv_name: str) -> None:
-    """Remove a logical volume."""
+    """Remove a logical volume. Deactivates first if needed."""
+    _sudo_run(["lvchange", "-an", f"/dev/{vg_name}/{lv_name}"], check=False)
     _sudo_run(["lvremove", "-f", f"/dev/{vg_name}/{lv_name}"])
     logger.info("LV '%s/%s' removed", vg_name, lv_name)
 
