@@ -7,10 +7,7 @@ import logging
 import click
 import yaml
 
-# Ensure src is importable
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from storage import (
+from .storage import (
     _sudo_run,
     setup_loop_device,
     detach_loop_device,

@@ -11,19 +11,15 @@ Also verifies snapshot space-saving mechanism and git sync mode.
 
 import os
 import subprocess
+import sys
 import tempfile
 import pytest
 
 # ── Helpers ───────────────────────────────────────────────────
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 
-# Add src to path for direct imports
-import sys
-sys.path.insert(0, SRC_DIR)
-
-from storage import (
+from aosp_orch.storage import (
     vg_exists,
     lv_exists,
     is_mounted,
@@ -35,7 +31,7 @@ from storage import (
     umount,
     docker_rm,
 )
-from main import (
+from aosp_orch.main import (
     get_base_project,
     VG_NAME,
     THIN_POOL_NAME,
@@ -50,7 +46,7 @@ from main import (
 
 def run_cli(config_path: str, *args) -> subprocess.CompletedProcess:
     """Run the orchestrator CLI with given config path."""
-    cmd = [sys.executable, os.path.join(SRC_DIR, "main.py"), "--config", config_path] + list(args)
+    cmd = [sys.executable, "-m", "aosp_orch", "--config", config_path] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result
 
@@ -145,7 +141,7 @@ def _prod_config() -> dict:
 @pytest.fixture(scope="session", autouse=True)
 def setup_mock_docker_image():
     """Ensure mock Docker image exists before tests."""
-    from storage import docker_build_mock, docker_image_exists
+    from aosp_orch.storage import docker_build_mock, docker_image_exists
     if not docker_image_exists("aosp-builder:mock"):
         docker_build_mock("aosp-builder:mock")
 
@@ -328,9 +324,9 @@ class TestAssertion1Initialization:
 
         # The base LV should be unmounted after link — mount to verify content
         if not is_lv_mounted(VG_NAME, base_lv_name):
-            from storage import activate_lv
+            from aosp_orch.storage import activate_lv
             activate_lv(VG_NAME, base_lv_name)
-            from storage import mount as do_mount
+            from aosp_orch.storage import mount as do_mount
             os.makedirs(base_mount_path, exist_ok=True)
             do_mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
 
@@ -356,7 +352,7 @@ class TestAssertion2SnapshotIsolation:
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Write ai_code.txt in workspace a container
-        from storage import docker_exec
+        from aosp_orch.storage import docker_exec
         c_name_a = "aosp_xxx_a"
         docker_exec(c_name_a, "echo 'AI was here' > /xxx/ai_code.txt")
 
@@ -420,7 +416,7 @@ class TestAssertion4ForceSync:
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # Write something in b to make it dirty
-        from storage import docker_exec
+        from aosp_orch.storage import docker_exec
         docker_exec("aosp_xxx_b", "echo 'dirty data' > /xxx/dirty.txt")
 
         # Run sync
@@ -479,7 +475,7 @@ class TestSnapshotSpaceSaving:
         initial_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
 
         # Write data to the workspace
-        from storage import docker_exec
+        from aosp_orch.storage import docker_exec
         result = docker_exec("aosp_xxx_a", "dd if=/dev/zero of=/xxx/test_large_file bs=1M count=20 2>&1 && sync")
         check = docker_exec("aosp_xxx_a", "ls -la /xxx/test_large_file 2>&1")
         assert "test_large_file" in check.stdout, f"Failed to write test_large_file: {check.stdout}"
@@ -531,7 +527,7 @@ class TestGitSync:
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         # Verify git-repo directory exists and has .git
-        from storage import docker_exec
+        from aosp_orch.storage import docker_exec
         c_name = "aosp_aosp_feature-a"
         check = docker_exec(c_name, "test -d /aosp/git-repo/.git && echo EXISTS || echo MISSING")
         assert "EXISTS" in check.stdout, f"git-repo/.git not found in container. Output: {check.stdout}"
@@ -557,7 +553,7 @@ class TestGitSync:
         assert result.returncode == 0, f"re-activate failed: {result.stderr}"
 
         # Verify git-repo still intact
-        from storage import docker_exec
+        from aosp_orch.storage import docker_exec
         c_name = "aosp_aosp_feature-a"
         check = docker_exec(c_name, "test -d /aosp/git-repo/.git && echo EXISTS || echo MISSING")
         assert "EXISTS" in check.stdout, f"git-repo/.git not found after re-activate. Output: {check.stdout}"

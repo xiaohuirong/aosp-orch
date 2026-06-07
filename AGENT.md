@@ -14,7 +14,10 @@
 aosp-env/
 ├── AGENT.md              # 本文档（项目上下文）
 ├── config.yaml           # YAML 配置文件
-├── src/
+├── pyproject.toml        # Python 包配置（依赖、入口点）
+├── aosp_orch/
+│   ├── __init__.py       # 包初始化（版本号）
+│   ├── __main__.py      # 支持 python -m aosp_orch
 │   ├── main.py           # CLI 入口（Click），所有命令
 │   └── storage.py        # 底层 LVM/Loop/Mount/Docker 操作封装
 └── test_orchestrator.py  # E2E 自动化测试（10 个用例）
@@ -106,10 +109,10 @@ base_projects:
 
 ```bash
 # 交互式
-python3 src/main.py init
+aosp-orch init
 
 # 全参数
-python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
+aosp-orch init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 ```
 
 ### `link` —— 配置 base project 并创建 base LV
@@ -124,10 +127,10 @@ python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image
 
 ```bash
 # 交互式
-python3 src/main.py link
+aosp-orch link
 
 # 全参数
-python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
+aosp-orch link --name xxx --repo-url ... --repo-branch main \
   --docker-image aosp-builder:mock --base-lv-size-gb 1 --sync-type repo
 ```
 
@@ -136,7 +139,7 @@ python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
 销毁该 base project 下所有 workspace（停容器 + 卸载 + 删快照）、销毁 base LV、从配置中移除。若该项目是 `default_base`，自动清除。
 
 ```bash
-python3 src/main.py unlink --base xxx
+aosp-orch unlink --base xxx
 ```
 
 ### `create` —— 创建工作区（写配置 + 创建快照 LV）
@@ -146,7 +149,7 @@ python3 src/main.py unlink --base xxx
 前提：base LV 已通过 `link` 创建。
 
 ```bash
-python3 src/main.py create <workspace_name> --base <project_name>
+aosp-orch create <workspace_name> --base <project_name>
 ```
 
 ### `mount` —— 挂载（不启动容器）
@@ -157,10 +160,10 @@ python3 src/main.py create <workspace_name> --base <project_name>
 
 ```bash
 # 挂载 workspace 快照
-python3 src/main.py mount <workspace_name> --base <project_name>
+aosp-orch mount <workspace_name> --base <project_name>
 
 # 挂载 base LV
-python3 src/main.py mount --base <project_name>
+aosp-orch mount --base <project_name>
 ```
 
 ### `unmount` —— 卸载（不停止容器）
@@ -169,10 +172,10 @@ python3 src/main.py mount --base <project_name>
 
 ```bash
 # 卸载 workspace 快照
-python3 src/main.py unmount <workspace_name> --base <project_name>
+aosp-orch unmount <workspace_name> --base <project_name>
 
 # 卸载 base LV
-python3 src/main.py unmount --base <project_name>
+aosp-orch unmount --base <project_name>
 ```
 
 ### `activate` —— 激活（mount + 启动容器）
@@ -183,10 +186,10 @@ python3 src/main.py unmount --base <project_name>
 
 ```bash
 # 激活 workspace
-python3 src/main.py activate <workspace_name> --base <project_name>
+aosp-orch activate <workspace_name> --base <project_name>
 
 # 激活 base LV（挂载 + 启动 default 容器）
-python3 src/main.py activate --base <project_name>
+aosp-orch activate --base <project_name>
 ```
 
 ### `enter` —— 进入容器
@@ -197,10 +200,10 @@ python3 src/main.py activate --base <project_name>
 
 ```bash
 # 进入 workspace 容器
-python3 src/main.py enter <workspace_name> --base <project_name>
+aosp-orch enter <workspace_name> --base <project_name>
 
 # 进入 base LV 的 default 容器
-python3 src/main.py enter --base <project_name>
+aosp-orch enter --base <project_name>
 ```
 
 ### `deactivate` —— 去激活（停容器 + 卸载）
@@ -209,10 +212,10 @@ python3 src/main.py enter --base <project_name>
 
 ```bash
 # 去激活 workspace
-python3 src/main.py deactivate <workspace_name> --base <project_name>
+aosp-orch deactivate <workspace_name> --base <project_name>
 
 # 去激活 base LV（停 default 容器 + 卸载）
-python3 src/main.py deactivate --base <project_name>
+aosp-orch deactivate --base <project_name>
 ```
 
 ### `remove` —— 彻底销毁工作区
@@ -220,7 +223,7 @@ python3 src/main.py deactivate --base <project_name>
 去激活 + 销毁快照卷 + 从配置中移除。
 
 ```bash
-python3 src/main.py remove <workspace_name> --base <project_name>
+aosp-orch remove <workspace_name> --base <project_name>
 ```
 
 ### `sync` —— 基底强制更新（清盘流）
@@ -230,13 +233,13 @@ python3 src/main.py remove <workspace_name> --base <project_name>
 前提：base LV 已通过 `link` 创建。
 
 ```bash
-python3 src/main.py sync --base <project_name>
+aosp-orch sync --base <project_name>
 ```
 
 ### `compile` —— 别名，等同 `sync`
 
 ```bash
-python3 src/main.py compile --base <project_name>
+aosp-orch compile --base <project_name>
 ```
 
 ---
@@ -406,3 +409,19 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 ### init 创建 LVM 磁盘
 
 原方案中 `init` 只写配置文件，LVM 磁盘（pool image/loop device/VG/thin pool）的创建延迟到 `link` 中执行。这导致 `link` 职责过重，且用户无法在 `link` 之前确认磁盘基础设施是否就绪。解决：将 LVM 磁盘创建移到 `init` 命令中，`init` 保存配置后立即调用 `_ensure_pool_and_vg()` 创建磁盘基础设施。`link` 只负责创建 base LV + 格式化 + 填充内容。典型工作流变为 `init` → `link` → `create` → `activate`。
+
+### 独立分发的 CLI 工具
+
+原方案为裸脚本调用（`python3 src/main.py`），依赖 `sys.path.insert` hack 导入模块，无法直接分发。解决：重构为标准 Python 包：
+
+- `src/` → `aosp_orch/`，添加 `__init__.py`、`__main__.py`
+- `from storage import` → `from .storage import`（相对导入）
+- 新增 `pyproject.toml`，声明依赖（`click`、`pyyaml`）和入口点 `aosp-orch = "aosp_orch.main:cli"`
+- 安装后直接使用 `aosp-orch` 命令，也支持 `python -m aosp_orch`
+
+安装方式：
+```bash
+pip install -e .          # 开发模式
+pip install .             # 正式安装
+pip install aosp-orch     # 从 PyPI（未来）
+```
