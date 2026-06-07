@@ -830,6 +830,52 @@ def sync(ctx, base):
 
 
 @cli.command()
+@click.option("--base", default=None, help="Base project 名称 (默认使用 global.default_base)")
+@click.pass_context
+def unlink(ctx, base):
+    """删除 base project 配置（销毁所有工作区 + 删除配置条目）。"""
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
+
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+
+    # 1. Destroy all workspace snapshots and containers
+    for ws in list(bp.get("workspaces", [])):
+        ws_name = ws["name"]
+        c_name = container_name(base, ws_name)
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        ws_mount_path = _workspace_mount_path(config, base, ws_name)
+        if is_mounted(ws_mount_path):
+            umount(ws_mount_path)
+        snapshot_lv_name = _snapshot_lv_name(ws_name)
+        if lv_exists(VG_NAME, snapshot_lv_name):
+            remove_lv(VG_NAME, snapshot_lv_name)
+
+    # 2. Destroy base LV
+    base_lv_name = _base_lv_name(base)
+    base_mount_path = _base_mount_path(config, base)
+    if is_mounted(base_mount_path):
+        umount(base_mount_path)
+    if lv_exists(VG_NAME, base_lv_name):
+        remove_lv(VG_NAME, base_lv_name)
+
+    # 3. Remove from config
+    config["base_projects"] = [bp for bp in config["base_projects"] if bp["name"] != base]
+
+    # 4. Clear default_base if it was this project
+    if config["global"].get("default_base") == base:
+        del config["global"]["default_base"]
+
+    save_config(config, config_path)
+    click.echo(f"Base project '{base}' unlinked.")
+
+
+@cli.command()
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def compile(ctx, base):
