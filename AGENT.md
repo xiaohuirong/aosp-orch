@@ -136,10 +136,22 @@ aosp-orch add --name xxx --repo-url ... --repo-branch main \
 
 ### `remove` —— 删除 base project（销毁所有资源 + 删除配置）
 
-销毁该 base project 下所有 workspace（停容器 + 卸载 + 删快照）、销毁 base LV、从配置中移除。若该项目是 `default_base`，自动清除。
+销毁该 base project 下所有 workspace（停容器 + 卸载 + 删快照）、销毁 base LV、从配置中移除。若该项目是 `default_base`，自动清除。需二次确认（默认 N）。
+
+`base_name` 为可选位置参数：不指定则使用 `global.default_base`，指定则操作该项目。
 
 ```bash
-aosp-orch remove --base xxx
+aosp-orch remove xxx
+aosp-orch remove              # 使用 default_base
+```
+
+### `default` —— 查看/设置/清空 default base project
+
+管理 `global.default_base` 配置。无参数时清空 default base，指定项目名时设为 default base（需项目已通过 `add` 添加）。
+
+```bash
+aosp-orch default xxx         # 将 xxx 设为 default base
+aosp-orch default             # 清空 default base
 ```
 
 ### `new` —— 创建工作区（写配置 + 创建快照 LV）
@@ -270,6 +282,8 @@ aosp-orch rebase --base <project_name>
 - **`deactivate`** = 停容器 + `unmount`
 - **`sync`** = `_destroy_all_workspaces` + 重新填充 base LV
 - **`rebase`** = 删除指定/所有 workspace 快照（保留配置，需确认）
+- **`remove`** = 删除 base project（位置参数，需确认）
+- **`default`** = 设置/清空 default_base
 - **`compile`** → `sync` 的别名
 
 使用 `.aosp_base_initialized` 标记文件判断 base LV 是否已首次填充。
@@ -476,3 +490,11 @@ pip install aosp-orch     # 从 PyPI（未来）
 ### enter 自动创建
 
 `enter` 命令在 workspace 不存在时不再直接报错退出，而是询问用户"是否立即创建?"（默认 Y）。确认后自动调用 `new` 创建 + `activate` 激活，再进入容器 Shell。
+
+### remove 使用位置参数 + 二次确认
+
+`remove` 命令改用位置参数代替 `--base` 选项。不传参数时使用 `global.default_base`，传参则操作指定项目。由于该操作会销毁所有数据，添加了二次确认（默认 N）。
+
+### default 命令
+
+新增 `default` 命令用于管理 `global.default_base` 配置。无参数时清空 default base，指定项目名时设为 default base（需项目已通过 `add` 添加）。这比之前只能在 `add` 交互模式下设置更灵活，用户可以随时切换或清空默认项目。
