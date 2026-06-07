@@ -1024,6 +1024,40 @@ def remove_cmd(ctx, base_name):
     click.echo(f"Base project '{base}' removed.")
 
 
+@cli.command("default")
+@click.argument("base_name", required=False)
+@click.pass_context
+def default_cmd(ctx, base_name):
+    """查看/设置/清空 default base project。
+
+    无参数：清空 default_base。
+    指定项目名：设为 default_base。
+    """
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+
+    if base_name is None:
+        # Clear default_base
+        current = config.get("global", {}).get("default_base")
+        if not current:
+            click.echo("当前没有设置 default base。")
+            return
+        del config["global"]["default_base"]
+        save_config(config, config_path)
+        click.echo(f"已清空 default base（原为 '{current}'）。")
+        return
+
+    # Set default_base
+    bp = get_base_project(config, base_name)
+    if bp is None:
+        click.echo(f"Base project '{base_name}' not found in config，请先运行 'add --name {base_name}'。", err=True)
+        sys.exit(1)
+
+    config["global"]["default_base"] = base_name
+    save_config(config, config_path)
+    click.echo(f"已将 '{base_name}' 设为 default base。")
+
+
 @cli.command()
 @click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
