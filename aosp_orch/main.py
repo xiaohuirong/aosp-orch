@@ -446,7 +446,7 @@ def init(ctx, mode, workdir, pool_image_size_gb):
         click.echo(f"  default_base    = {default_base}")
 
 
-@cli.command()
+@cli.command("add")
 @click.option("--name", default=None, help="Base project 名称")
 @click.option("--repo-url", default=None, help="远程清单仓库地址")
 @click.option("--repo-branch", default=None, help="清单仓库分支")
@@ -455,8 +455,8 @@ def init(ctx, mode, workdir, pool_image_size_gb):
 @click.option("--sync-type", type=click.Choice(["repo", "git"]), default=None,
               help="代码同步方式: repo (默认) | git")
 @click.pass_context
-def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type):
-    """配置 base project 并创建 LVM 基础设施（池/VG/LV/格式化/填充）。"""
+def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type):
+    """配置 base project 并创建 base LV（格式化 + 填充内容）。"""
     config_path = ctx.obj["config_path"]
 
     # Load or create config
@@ -570,11 +570,11 @@ def link(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_t
         click.echo(f"  default_base    = {bp_name}")
 
 
-@cli.command()
+@cli.command("new")
 @click.argument("workspace_name")
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
-def create(ctx, workspace_name, base):
+def new_cmd(ctx, workspace_name, base):
     """创建工作区：写配置 + 创建快照 LV。幂等：workspace 已存在但快照不存在时仅创建快照。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -802,7 +802,7 @@ def enter(ctx, workspace_name, base):
     ws = get_workspace(bp, workspace_name)
     if ws is None:
         if click.confirm(f"Workspace '{workspace_name}' 不存在，是否立即创建?", default=True):
-            ctx.invoke(create, workspace_name=workspace_name, base=base)
+            ctx.invoke(new_cmd, workspace_name=workspace_name, base=base)
         else:
             sys.exit(1)
 
@@ -861,11 +861,11 @@ def deactivate(ctx, workspace_name, base):
     click.echo(f"Workspace '{workspace_name}' deactivated.")
 
 
-@cli.command()
+@cli.command("del")
 @click.argument("workspace_name")
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
-def remove(ctx, workspace_name, base):
+def del_cmd(ctx, workspace_name, base):
     """彻底销毁工作区（deactivate + 销毁快照 + 删配置）。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -976,10 +976,10 @@ def sync(ctx, base):
     click.echo(f"Base project '{base}' synced successfully.")
 
 
-@cli.command()
+@cli.command("remove")
 @click.option("--base", default=None, help="Base project 名称 (默认使用 global.default_base)")
 @click.pass_context
-def unlink(ctx, base):
+def remove_cmd(ctx, base):
     """删除 base project（销毁所有工作区 + 销毁 base LV + 删除配置条目）。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)

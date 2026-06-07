@@ -90,9 +90,9 @@ base_projects:
 
 1. **`--base` 显式指定** → 使用指定值
 2. **`global.default_base`** → 使用配置中的默认项目
-3. **两者都没有** → 报错退出，提示用户使用 `--base` 或先 `link` 一个项目并设为默认
+3. **两者都没有** → 报错退出，提示用户使用 `--base` 或先 `add` 一个项目并设为默认
 
-`link` 命令交互模式下会询问"是否将此项目设为默认?"（默认 Y），确认后写入 `global.default_base`。
+`add` 命令交互模式下会询问"是否将此项目设为默认?"（默认 Y），确认后写入 `global.default_base`。
 
 ### `workspace_name` 参数与 base LV 操作
 
@@ -101,7 +101,7 @@ base_projects:
 - **指定 workspace_name** → 操作该 workspace 的快照卷
 - **不指定 workspace_name** → 操作 base LV 本身（挂载到 `base_mount`，容器名为 `{project}_default`）
 
-`create` 和 `remove` 的 `workspace_name` 仍为必填，因为它们只针对 workspace 操作。
+`new` 和 `del` 的 `workspace_name` 仍为必填，因为它们只针对 workspace 操作。
 
 ### `init` —— 初始化全局配置 + 创建 LVM 磁盘
 
@@ -115,7 +115,7 @@ aosp-orch init
 aosp-orch init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 ```
 
-### `link` —— 配置 base project 并创建 base LV
+### `add` —— 添加 base project 并创建 base LV
 
 交互式或全参数配置 base project，并**立即创建** base LV：格式化 + 填充内容。支持 `--sync-type` 选择 repo/git 同步方式。
 
@@ -127,36 +127,36 @@ aosp-orch init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 
 ```bash
 # 交互式
-aosp-orch link
+aosp-orch add
 
 # 全参数
-aosp-orch link --name xxx --repo-url ... --repo-branch main \
+aosp-orch add --name xxx --repo-url ... --repo-branch main \
   --docker-image aosp-builder:mock --base-lv-size-gb 1 --sync-type repo
 ```
 
-### `unlink` —— 删除 base project（销毁所有资源 + 删除配置）
+### `remove` —— 删除 base project（销毁所有资源 + 删除配置）
 
 销毁该 base project 下所有 workspace（停容器 + 卸载 + 删快照）、销毁 base LV、从配置中移除。若该项目是 `default_base`，自动清除。
 
 ```bash
-aosp-orch unlink --base xxx
+aosp-orch remove --base xxx
 ```
 
-### `create` —— 创建工作区（写配置 + 创建快照 LV）
+### `new` —— 创建工作区（写配置 + 创建快照 LV）
 
 在配置文件中添加 workspace 条目，并**立即创建**快照 LV。幂等：若 workspace 已存在于配置中但快照 LV 不存在，仅创建快照。
 
-前提：base LV 已通过 `link` 创建。
+前提：base LV 已通过 `add` 创建。
 
 ```bash
-aosp-orch create <workspace_name> --base <project_name>
+aosp-orch new <workspace_name> --base <project_name>
 ```
 
 ### `mount` —— 挂载（不启动容器）
 
 激活 LV + 挂载 + 修复权限，**不启动容器**。适合仅需访问文件系统的场景。
 
-前提：LV 已存在（base LV 通过 `link`，快照通过 `create`）。
+前提：LV 已存在（base LV 通过 `add`，快照通过 `new`）。
 
 ```bash
 # 挂载 workspace 快照
@@ -182,7 +182,7 @@ aosp-orch unmount --base <project_name>
 
 挂载 + 启动容器。不指定 workspace 时激活 base LV（挂载 + 启动 default 容器）。
 
-前提：workspace 已 `create`，base LV 已 `link`。
+前提：workspace 已 `new`，base LV 已 `add`。
 
 ```bash
 # 激活 workspace
@@ -196,7 +196,7 @@ aosp-orch activate --base <project_name>
 
 进入容器交互 Shell。容器未激活时询问是否自动激活（默认 Y）。
 
-前提：workspace 已 `create`，base LV 已 `link`。
+前提：workspace 已 `new`，base LV 已 `add`。
 
 ```bash
 # 进入 workspace 容器
@@ -218,19 +218,19 @@ aosp-orch deactivate <workspace_name> --base <project_name>
 aosp-orch deactivate --base <project_name>
 ```
 
-### `remove` —— 彻底销毁工作区
+### `del` —— 彻底销毁工作区
 
 去激活 + 销毁快照卷 + 从配置中移除。
 
 ```bash
-aosp-orch remove <workspace_name> --base <project_name>
+aosp-orch del <workspace_name> --base <project_name>
 ```
 
 ### `sync` —— 基底强制更新（清盘流）
 
-销毁所有子工作区的快照卷和容器，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次需先 `create` 重建快照再 `activate`。支持 repo/git 两种同步方式。
+销毁所有子工作区的快照卷和容器，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次需先 `new` 重建快照再 `activate`。支持 repo/git 两种同步方式。
 
-前提：base LV 已通过 `link` 创建。
+前提：base LV 已通过 `add` 创建。
 
 ```bash
 aosp-orch sync --base <project_name>
@@ -244,7 +244,7 @@ aosp-orch compile --base <project_name>
 
 ### `rebase` —— 删除 workspace 快照（保留配置和 base LV）
 
-销毁指定 workspace 的快照卷和容器，**保留配置条目和 base LV**。下次 `create` 可重建快照。
+销毁指定 workspace 的快照卷和容器，**保留配置条目和 base LV**。下次 `new` 可重建快照。
 
 `workspace_name` 为可选：不指定则删除该 base 下所有 workspace。操作需二次确认（默认 N）。
 
@@ -263,8 +263,8 @@ aosp-orch rebase --base <project_name>
 每个命令有明确职责，无懒加载。用户需按正确顺序调用命令：
 
 - **`init`** → 创建 LVM 磁盘基础设施（pool image/loop device/VG/thin pool）
-- **`link`** → 创建 base LV + 格式化 + 填充内容（前提：`init` 已创建磁盘）
-- **`create`** → 创建快照 LV（前提：base LV 已通过 `link` 创建）
+- **`add`** → 创建 base LV + 格式化 + 填充内容（前提：`init` 已创建磁盘）
+- **`new`** → 创建快照 LV（前提：base LV 已通过 `add` 创建）
 - **`mount`** → 激活 LV + 挂载 + 修复权限（前提：LV 已存在）
 - **`activate`** = `mount` + 启动容器
 - **`deactivate`** = 停容器 + `unmount`
@@ -279,13 +279,13 @@ aosp-orch rebase --base <project_name>
 ```
 activate  = mount + docker_run
 deactivate = docker_rm + unmount
-remove    = deactivate + lvremove + 删配置
+del       = deactivate + lvremove + 删配置
 rebase    = docker_rm + unmount + lvremove（保留配置，需确认）
 sync      = _destroy_all_workspaces + _ensure_base_lv + 重新填充
-unlink    = _destroy_all_workspaces + lvremove(base) + 删配置
+remove    = _destroy_all_workspaces + lvremove(base) + 删配置
 ```
 
-`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync`、`rebase`（不指定 workspace 时）和 `unlink` 复用。
+`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync`、`rebase`（不指定 workspace 时）和 `remove` 复用。
 
 ---
 
@@ -332,7 +332,7 @@ base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 
 ### sync 不删除配置
 
-`sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次需先 `create` 重建快照再 `activate`，无需重新在配置中添加 workspace。
+`sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次需先 `new` 重建快照再 `activate`，无需重新在配置中添加 workspace。
 
 ---
 
@@ -353,11 +353,11 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 
 | 类 | 用例 | 验证内容 |
 |---|---|---|
-| 断言1 | `test_link_writes_config_and_creates_infrastructure` | link 写入配置 + 创建 LVM 基础设施 |
-| 断言1 | `test_link_creates_base_lv_with_mock_output` | link 创建 base LV 含 mock 产物 |
+| 断言1 | `test_link_writes_config_and_creates_infrastructure` | add 写入配置 + 创建 LVM 基础设施 |
+| 断言1 | `test_link_creates_base_lv_with_mock_output` | add 创建 base LV 含 mock 产物 |
 | 断言2 | `test_workspace_isolation` | 工作区 a 写入的文件在 b 中不可见（块设备级物理隔离） |
 | 断言3 | `test_deactivate_unmounts_and_removes_container` | deactivate 后快照已卸载、容器已删除 |
-| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 需重新 create 再 activate |
+| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 需重新 new 再 activate |
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
@@ -412,7 +412,7 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 
 ### default_base 机制
 
-多个 base project 时每次都要传 `--base` 很繁琐。解决：在 `global` 中增加 `default_base` 字段，`link` 交互时询问是否设为默认，`--base` 参数改为可选，未指定时自动使用 `default_base`。
+多个 base project 时每次都要传 `--base` 很繁琐。解决：在 `global` 中增加 `default_base` 字段，`add` 交互时询问是否设为默认，`--base` 参数改为可选，未指定时自动使用 `default_base`。
 
 ### mount/unmount 细粒度控制
 
@@ -424,7 +424,7 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 
 ### init 创建 LVM 磁盘
 
-原方案中 `init` 只写配置文件，LVM 磁盘（pool image/loop device/VG/thin pool）的创建延迟到 `link` 中执行。这导致 `link` 职责过重，且用户无法在 `link` 之前确认磁盘基础设施是否就绪。解决：将 LVM 磁盘创建移到 `init` 命令中，`init` 保存配置后立即调用 `_ensure_pool_and_vg()` 创建磁盘基础设施。`link` 只负责创建 base LV + 格式化 + 填充内容。典型工作流变为 `init` → `link` → `create` → `activate`。
+原方案中 `init` 只写配置文件，LVM 磁盘（pool image/loop device/VG/thin pool）的创建延迟到 `add` 中执行。这导致 `add` 职责过重，且用户无法在 `add` 之前确认磁盘基础设施是否就绪。解决：将 LVM 磁盘创建移到 `init` 命令中，`init` 保存配置后立即调用 `_ensure_pool_and_vg()` 创建磁盘基础设施。`add` 只负责创建 base LV + 格式化 + 填充内容。典型工作流变为 `init` → `add` → `new` → `activate`。
 
 ### 独立分发的 CLI 工具
 
@@ -454,10 +454,25 @@ pip install aosp-orch     # 从 PyPI（未来）
 
 ### rebase 命令
 
-`rebase` 用于删除 workspace 快照但保留配置条目，方便下次 `create` 重建。与 `sync` 和 `remove` 的区别：
+`rebase` 用于删除 workspace 快照但保留配置条目，方便下次 `new` 重建。与 `sync` 和 `del` 的区别：
 
 - **`rebase`**：只删快照 + 保留配置 + 保留 base LV + 需确认
 - **`sync`**：删快照 + 保留配置 + 重新填充 base LV（不删 base LV）
-- **`remove`**：删快照 + 删配置（针对单个 workspace）
+- **`del`**：删快照 + 删配置（针对单个 workspace）
 
 `rebase` 支持可选 `workspace_name`：不指定则删除所有 workspace 快照（需确认），指定则只删除该 workspace 快照（需确认）。确认默认为 N，防止误操作。
+
+### 命令重命名
+
+为使命令更简洁直观，进行了以下重命名：
+
+- `link` → `add`：添加 base project
+- `unlink` → `remove`：删除 base project
+- `create` → `new`：创建 workspace
+- `remove` → `del`：删除 workspace
+
+注意：`del` 和 `new` 是 Python 关键字/内置函数，不能直接用作函数名。实现中使用 Click 的 `@cli.command("del")` 指定命令名，函数名改为 `del_cmd` / `new_cmd`。
+
+### enter 自动创建
+
+`enter` 命令在 workspace 不存在时不再直接报错退出，而是询问用户"是否立即创建?"（默认 Y）。确认后自动调用 `new` 创建 + `activate` 激活，再进入容器 Shell。
