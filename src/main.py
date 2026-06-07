@@ -581,11 +581,11 @@ def create(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.argument("workspace_name")
+@click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def mount_cmd(ctx, workspace_name, base):
-    """挂载工作区快照（懒加载快照 + 挂载，不启动容器）。"""
+    """挂载工作区快照。不指定 workspace 时挂载 base LV。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -594,6 +594,21 @@ def mount_cmd(ctx, workspace_name, base):
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    project_name = bp["name"]
+
+    if workspace_name is None:
+        # Mount base LV directly
+        _ensure_base_lv(config, bp)
+        base_lv_name = _base_lv_name(project_name)
+        base_mount_path = _base_mount_path(config, project_name)
+        activate_lv(VG_NAME, base_lv_name)
+        os.makedirs(base_mount_path, exist_ok=True)
+        if not is_lv_mounted(VG_NAME, base_lv_name):
+            mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
+        _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+        click.echo(f"Base LV '{base}' mounted at {base_mount_path}.")
+        return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
@@ -604,7 +619,6 @@ def mount_cmd(ctx, workspace_name, base):
         save_config(config, config_path)
         click.echo(f"Workspace '{workspace_name}' created.")
 
-    project_name = bp["name"]
     base_lv_name = _base_lv_name(project_name)
     snapshot_lv_name = _snapshot_lv_name(workspace_name)
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
@@ -631,11 +645,11 @@ def mount_cmd(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.argument("workspace_name")
+@click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def unmount_cmd(ctx, workspace_name, base):
-    """卸载工作区快照（不停止容器）。"""
+    """卸载工作区快照。不指定 workspace 时卸载 base LV。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -644,6 +658,20 @@ def unmount_cmd(ctx, workspace_name, base):
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    project_name = bp["name"]
+
+    if workspace_name is None:
+        # Unmount base LV
+        base_lv_name = _base_lv_name(project_name)
+        base_mount_path = _base_mount_path(config, project_name)
+        if not is_mounted(base_mount_path) and not is_lv_mounted(VG_NAME, base_lv_name):
+            click.echo(f"Base LV '{base}' is already unmounted.")
+            return
+        if is_mounted(base_mount_path):
+            umount(base_mount_path)
+        click.echo(f"Base LV '{base}' unmounted.")
+        return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
@@ -664,13 +692,14 @@ def unmount_cmd(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.argument("workspace_name")
+@click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def activate(ctx, workspace_name, base):
     """Activate a workspace (mount + start container).
 
     Auto-creates the workspace if it doesn't exist yet.
+    不指定 workspace 时挂载 base LV 并启动 default 容器。
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -680,6 +709,22 @@ def activate(ctx, workspace_name, base):
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    project_name = bp["name"]
+    docker_image = bp["docker_image"]
+
+    if workspace_name is None:
+        # Activate base LV: mount + start default container
+        ctx.invoke(mount_cmd, workspace_name=None, base=base)
+        base_mount_path = _base_mount_path(config, project_name)
+        c_name = container_name(project_name, "default")
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        uid = os.getuid()
+        gid = os.getgid()
+        docker_run(c_name, base_mount_path, f"/{project_name}", docker_image, uid=uid, gid=gid)
+        click.echo(f"Base LV '{base}' activated.")
+        return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
@@ -695,9 +740,7 @@ def activate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' is already active.")
         return
 
-    project_name = bp["name"]
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
-    docker_image = bp["docker_image"]
 
     # Mount (lazy snapshot + mount)
     ctx.invoke(mount_cmd, workspace_name=workspace_name, base=base)
@@ -714,13 +757,14 @@ def activate(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.argument("workspace_name")
+@click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def enter(ctx, workspace_name, base):
     """Enter a workspace container interactively.
 
     Auto-activates the workspace if not yet active.
+    不指定 workspace 时进入 base LV 的 default 容器。
     """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
@@ -730,6 +774,18 @@ def enter(ctx, workspace_name, base):
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    project_name = bp["name"]
+
+    if workspace_name is None:
+        # Enter base LV's default container
+        c_name = container_name(project_name, "default")
+        if not docker_container_exists(c_name):
+            if not click.confirm(f"Base LV '{base}' 未激活，是否激活?", default=True):
+                sys.exit(0)
+            ctx.invoke(activate, workspace_name=None, base=base)
+        os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
+        return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
@@ -750,11 +806,14 @@ def enter(ctx, workspace_name, base):
 
 
 @cli.command()
-@click.argument("workspace_name")
+@click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def deactivate(ctx, workspace_name, base):
-    """Deactivate a workspace (stop container + unmount)."""
+    """Deactivate a workspace (stop container + unmount).
+
+    不指定 workspace 时停掉 base LV 的 default 容器并卸载。
+    """
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
     base = _resolve_base(config, base)
@@ -763,6 +822,17 @@ def deactivate(ctx, workspace_name, base):
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    project_name = bp["name"]
+
+    if workspace_name is None:
+        # Deactivate base LV: stop default container + unmount
+        c_name = container_name(project_name, "default")
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        ctx.invoke(unmount_cmd, workspace_name=None, base=base)
+        click.echo(f"Base LV '{base}' deactivated.")
+        return
 
     ws = get_workspace(bp, workspace_name)
     if ws is None:
