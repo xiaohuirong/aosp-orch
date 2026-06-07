@@ -194,9 +194,9 @@ aosp-orch activate --base <project_name>
 
 ### `enter` —— 进入容器
 
-进入容器交互 Shell。
+进入容器交互 Shell。容器未激活时询问是否自动激活（默认 Y）。
 
-前提：workspace 已 `activate`。
+前提：workspace 已 `create`，base LV 已 `link`。
 
 ```bash
 # 进入 workspace 容器
@@ -425,3 +425,13 @@ pip install -e .          # 开发模式
 pip install .             # 正式安装
 pip install aosp-orch     # 从 PyPI（未来）
 ```
+
+### init 覆盖已有 pool image
+
+`init` 创建 LVM 磁盘前会检查 pool image 是否已存在。若存在，询问用户是否覆盖（默认 N）。覆盖时先调用 `_destroy_lvm_infrastructure()` 销毁所有容器、卸载、删除所有 LV/VG/loop device，再删除 pool image 文件，最后重新创建。不覆盖则跳过磁盘创建，保留现有数据。
+
+`_destroy_lvm_infrastructure()` 是内部函数，遍历所有 base project 执行停容器 + 卸载 + 删 LV，然后删除 VG 和 loop device。被 `init` 覆盖流程复用。
+
+### enter 自动激活
+
+`enter` 命令在容器未激活时不再直接报错退出，而是询问用户"是否立即激活?"（默认 Y）。确认后自动调用 `activate` 激活，再进入容器 Shell。对 base LV 和 workspace 均适用。
