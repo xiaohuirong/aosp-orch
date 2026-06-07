@@ -977,18 +977,30 @@ def sync(ctx, base):
 
 
 @cli.command("remove")
-@click.option("--base", default=None, help="Base project 名称 (默认使用 global.default_base)")
+@click.argument("base_name", required=False)
 @click.pass_context
-def remove_cmd(ctx, base):
-    """删除 base project（销毁所有工作区 + 销毁 base LV + 删除配置条目）。"""
+def remove_cmd(ctx, base_name):
+    """删除 base project（销毁所有工作区 + 销毁 base LV + 删除配置条目）。需二次确认。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
+
+    # Resolve base: argument > default_base
+    if base_name is not None:
+        base = base_name
+    else:
+        base = config.get("global", {}).get("default_base")
+        if not base:
+            click.echo("未指定 base project，且未设置 global.default_base。请提供参数或先 add 一个项目并设为默认。", err=True)
+            sys.exit(1)
 
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+
+    if not click.confirm(f"将删除 base project '{base}' 及其所有 workspace，确认?", default=False):
+        click.echo("已取消。")
+        return
 
     # 1. Destroy all workspace snapshots and containers
     _destroy_all_workspaces(config, bp)
@@ -1009,7 +1021,7 @@ def remove_cmd(ctx, base):
         del config["global"]["default_base"]
 
     save_config(config, config_path)
-    click.echo(f"Base project '{base}' unlinked.")
+    click.echo(f"Base project '{base}' removed.")
 
 
 @cli.command()
