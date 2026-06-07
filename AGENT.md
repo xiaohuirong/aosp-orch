@@ -498,3 +498,57 @@ pip install aosp-orch     # 从 PyPI（未来）
 ### default 命令
 
 新增 `default` 命令用于管理 `global.default_base` 配置。无参数时清空 default base，指定项目名时设为 default base（需项目已通过 `add` 添加）。这比之前只能在 `add` 交互模式下设置更灵活，用户可以随时切换或清空默认项目。
+
+---
+
+## 九、 代码重构与优化
+
+### 公共函数提取
+
+#### `_resolve_bp(ctx, base) -> (config, bp, base)`
+
+9 个命令（`new`、`mount`、`unmount`、`activate`、`enter`、`deactivate`、`del`、`sync`、`rebase`）都重复了"加载配置 → 解析 base → 查找项目 → 不存在则退出"的样板代码。提取为 `_resolve_bp` 统一处理，返回三元组 `(config, bp, base)`。**注意返回值包含解析后的 `base`**（原始参数可能是 `None`，解析后是 `default_base` 的值），调用者必须使用返回的 `base` 而非原始参数。
+
+#### `_mount_lv(lv_name, mount_path)`
+
+`mount_cmd` 中 base LV 和 workspace 分支都重复 activate+mount+chown 逻辑。提取为 `_mount_lv(lv_name, mount_path)` 统一处理。
+
+#### `_start_container(c_name, mount_path, project_name, docker_image)`
+
+`activate` 中 base 和 workspace 分支都重复 docker_rm+docker_run 逻辑。提取为 `_start_container` 统一处理。
+
+#### `_destroy_workspace(config, base, ws_name)`
+
+提取单个 workspace 的停容器+卸载+删快照逻辑。`_destroy_all_workspaces` 内部循环调用它，`rebase` 单 workspace 分支也直接调用，消除了重复的 docker_rm/umount/remove_lv 逻辑。
+
+### `sync` 复用 `_populate_base`
+
+`sync` 命令中 ~40 行的 mock/prod 分支填充逻辑与 `_populate_base` 几乎完全重复。给 `_populate_base` 加了 `force=True` 参数（先删 marker 再填充），`sync` 直接调用 `_populate_base(config, bp, force=True)` 即可。同时 `_populate_base` 增加了幂等性：挂载前检查 `is_lv_mounted`，卸载前检查 `is_lv_mounted`。
+
+### `compile` 命令简化
+
+`compile` 命令不再冗余地加载配置和解析 base（`sync` 自己会做），直接 `ctx.invoke(sync, base=base)`。函数名改为 `compile_cmd`（避免与内置函数冲突）。
+
+### `remove_cmd` 复用 `_resolve_base`
+
+`remove_cmd` 使用位置参数 `base_name` 而非 `--base`，但解析逻辑与 `_resolve_base` 一致。简化为 `base = base_name or _resolve_base(config, None)`。
+
+### 死代码清理
+
+- **storage.py**: 删除未使用的 `deactivate_lv` 和 `mock_compile` 函数（整个项目中无任何调用者）
+- **main.py**: 从 import 中移除 `deactivate_lv`、`get_lv_data_percent`、`get_lv_size_info`、`mock_compile`（`get_lv_data_percent` 和 `get_lv_size_info` 仍被测试文件直接从 storage 导入使用）
+
+### `remove_lv` 自动去激活
+
+`lvremove` 在 LV 仍处于激活状态时会报 "Logical volume contains a filesystem in use" 错误。修改 `remove_lv` 在删除前先执行 `lvchange -an`（`check=False` 确保已 inactive 时也不报错），再执行 `lvremove`。
+
+### `new` 命令自动创建 base LV
+
+`new` 命令发现 base LV 不存在时，不再报错退出或调 `add_cmd`（会进入交互模式），而是直接用已有配置自动创建：`_ensure_pool_and_vg` + `create_thin_lv` + `format_ext4` + `_populate_base`。这样 `enter` 的自动创建链路（enter → new → 自动创建 base LV）可以无交互完成。
+
+### 旧命令名清理
+
+所有提示信息、注释、docstring 中的旧命令名已统一替换：
+- `link` → `add`（提示信息、注释）
+- `unlink` → `remove`（注释）
+- `create` → `new`（提示信息、docstring、输出消息）
