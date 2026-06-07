@@ -17,7 +17,7 @@ aosp-env/
 ├── src/
 │   ├── main.py           # CLI 入口（Click），所有命令
 │   └── storage.py        # 底层 LVM/Loop/Mount/Docker 操作封装
-└── test_orchestrator.py  # E2E 自动化测试（11 个用例）
+└── test_orchestrator.py  # E2E 自动化测试（10 个用例）
 ```
 
 ---
@@ -112,11 +112,13 @@ python3 src/main.py init
 python3 src/main.py init --mode mock --workdir /tmp/aosp_workspaces --pool-image-size-gb 2
 ```
 
-### `link` —— 配置 base project（仅写配置，不触发 LVM）
+### `link` —— 配置 base project 并创建 LVM 基础设施
 
-交互式或全参数配置 base project。**纯元数据操作**，不创建任何 LVM 资源。LVM 操作延迟到 `activate`/`mount`/`sync`/`compile` 时懒加载执行。支持 `--sync-type` 选择 repo/git 同步方式。
+交互式或全参数配置 base project，并**立即创建** LVM 基础设施：池/VG/LV/格式化/填充内容。支持 `--sync-type` 选择 repo/git 同步方式。
 
 交互模式下会询问是否设为默认项目（写入 `global.default_base`）。
+
+若 base LV 已存在，检查是否已填充（通过 `.aosp_base_initialized` 标记），未填充则自动填充。
 
 ```bash
 # 交互式
@@ -135,9 +137,11 @@ python3 src/main.py link --name xxx --repo-url ... --repo-branch main \
 python3 src/main.py unlink --base xxx
 ```
 
-### `create` —— 创建工作区（纯元数据）
+### `create` —— 创建工作区（写配置 + 创建快照 LV）
 
-在配置文件中添加 workspace 条目（仅 `name` 字段），不触发任何 LVM/Docker 操作。
+在配置文件中添加 workspace 条目，并**立即创建**快照 LV。幂等：若 workspace 已存在于配置中但快照 LV 不存在，仅创建快照。
+
+前提：base LV 已通过 `link` 创建。
 
 ```bash
 python3 src/main.py create <workspace_name> --base <project_name>
@@ -145,7 +149,9 @@ python3 src/main.py create <workspace_name> --base <project_name>
 
 ### `mount` —— 挂载（不启动容器）
 
-懒加载快照 + 挂载 + 修复权限，**不启动容器**。适合仅需访问文件系统的场景。
+激活 LV + 挂载 + 修复权限，**不启动容器**。适合仅需访问文件系统的场景。
+
+前提：LV 已存在（base LV 通过 `link`，快照通过 `create`）。
 
 ```bash
 # 挂载 workspace 快照
@@ -169,9 +175,9 @@ python3 src/main.py unmount --base <project_name>
 
 ### `activate` —— 激活（mount + 启动容器）
 
-触发懒加载：若 base LV 不存在则自动创建池、VG、LV、格式化、填充内容。然后创建快照、挂载、启动容器。
+挂载 + 启动容器。不指定 workspace 时激活 base LV（挂载 + 启动 default 容器）。
 
-**自动创建**：若 workspace 不存在，询问用户是否创建（默认 Y），确认后自动创建并激活。
+前提：workspace 已 `create`，base LV 已 `link`。
 
 ```bash
 # 激活 workspace
@@ -181,12 +187,11 @@ python3 src/main.py activate <workspace_name> --base <project_name>
 python3 src/main.py activate --base <project_name>
 ```
 
-### `enter` —— 进入容器（自动补充前序步骤）
+### `enter` —— 进入容器
 
-进入容器交互 Shell。自动检查并补充前序步骤：
+进入容器交互 Shell。
 
-1. **容器不存在** → 询问"是否激活?"（默认 Y）→ 自动 activate
-2. 进入容器 `docker exec -it`
+前提：workspace 已 `activate`。
 
 ```bash
 # 进入 workspace 容器
@@ -218,7 +223,9 @@ python3 src/main.py remove <workspace_name> --base <project_name>
 
 ### `sync` —— 基底强制更新（清盘流）
 
-销毁所有子工作区的快照卷和容器，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次 activate 时自动重建快照。支持 repo/git 两种同步方式。
+销毁所有子工作区的快照卷和容器，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次需先 `create` 重建快照再 `activate`。支持 repo/git 两种同步方式。
+
+前提：base LV 已通过 `link` 创建。
 
 ```bash
 python3 src/main.py sync --base <project_name>
@@ -232,20 +239,19 @@ python3 src/main.py compile --base <project_name>
 
 ---
 
-## 五、 懒加载机制
+## 五、 命令职责与复用
 
-`link` 只写配置，不触发任何 LVM/Docker 操作。实际基础设施在需要时按需创建：
+每个命令有明确职责，无懒加载。用户需按正确顺序调用命令：
 
-- **`mount`** → 发现 base LV 不存在 → 自动创建池/VG/LV/格式化/填充 → 创建快照 → 挂载
-- **`activate`** → 调用 `mount` → 启动容器
-- **`sync`** → 同样懒加载确保基础设施就绪 → 清盘 → 重新填充
+- **`link`** → 创建 LVM 基础设施（池/VG/LV/格式化/填充）
+- **`create`** → 创建快照 LV（前提：base LV 已通过 `link` 创建）
+- **`mount`** → 激活 LV + 挂载 + 修复权限（前提：LV 已存在）
+- **`activate`** = `mount` + 启动容器
+- **`deactivate`** = 停容器 + `unmount`
+- **`sync`** = `_destroy_all_workspaces` + 重新填充 base LV
 - **`compile`** → `sync` 的别名
 
 使用 `.aosp_base_initialized` 标记文件判断 base LV 是否已首次填充。
-
-### `_ensure_base_lv` 优化
-
-只在首次填充时挂载 base LV（检查 marker），已填充的情况下跳过 mount/unmount 周期。函数结束后 base LV 保持卸载状态（快照从卸载的 base 创建以确保文件系统一致性）。
 
 ### 命令复用关系
 
@@ -304,14 +310,14 @@ base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 
 ### sync 不删除配置
 
-`sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次 `activate` 时自动重建快照，无需重新 `create`。
+`sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次需先 `create` 重建快照再 `activate`，无需重新在配置中添加 workspace。
 
 ---
 
 ## 七、 测试
 
 ```bash
-python3 -m pytest test_orchestrator.py -v    # 必须输出 11 passed
+python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 ```
 
 ### 测试架构
@@ -321,16 +327,15 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 11 passed
 - Mock 测试：workdir = `/tmp/aosp_test_mock`，项目名 `xxx`，Docker 镜像 `aosp-builder:mock`
 - Prod/Git 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`，sync_type = git
 
-### 11 个测试用例
+### 10 个测试用例
 
 | 类 | 用例 | 验证内容 |
 |---|---|---|
-| 断言1 | `test_link_writes_config` | link 写入配置 + 自动推导字段不存配置 |
-| 断言1 | `test_activate_creates_pool_image` | activate 懒加载创建 pool image |
-| 断言1 | `test_activate_creates_vg_and_base_lv_with_mock_output` | activate 懒加载创建 VG + base LV 含 mock 产物 |
+| 断言1 | `test_link_writes_config_and_creates_infrastructure` | link 写入配置 + 创建 LVM 基础设施 |
+| 断言1 | `test_link_creates_base_lv_with_mock_output` | link 创建 base LV 含 mock 产物 |
 | 断言2 | `test_workspace_isolation` | 工作区 a 写入的文件在 b 中不可见（块设备级物理隔离） |
 | 断言3 | `test_deactivate_unmounts_and_removes_container` | deactivate 后快照已卸载、容器已删除 |
-| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 重新 activate 后懒加载重建且干净 |
+| 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 需重新 create 再 activate |
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
