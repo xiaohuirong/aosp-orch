@@ -242,6 +242,20 @@ aosp-orch sync --base <project_name>
 aosp-orch compile --base <project_name>
 ```
 
+### `rebase` —— 删除 workspace 快照（保留配置和 base LV）
+
+销毁指定 workspace 的快照卷和容器，**保留配置条目和 base LV**。下次 `create` 可重建快照。
+
+`workspace_name` 为可选：不指定则删除该 base 下所有 workspace。操作需二次确认（默认 N）。
+
+```bash
+# 删除指定 workspace
+aosp-orch rebase <workspace_name> --base <project_name>
+
+# 删除所有 workspace
+aosp-orch rebase --base <project_name>
+```
+
 ---
 
 ## 五、 命令职责与复用
@@ -255,6 +269,7 @@ aosp-orch compile --base <project_name>
 - **`activate`** = `mount` + 启动容器
 - **`deactivate`** = 停容器 + `unmount`
 - **`sync`** = `_destroy_all_workspaces` + 重新填充 base LV
+- **`rebase`** = 删除指定/所有 workspace 快照（保留配置，需确认）
 - **`compile`** → `sync` 的别名
 
 使用 `.aosp_base_initialized` 标记文件判断 base LV 是否已首次填充。
@@ -265,11 +280,12 @@ aosp-orch compile --base <project_name>
 activate  = mount + docker_run
 deactivate = docker_rm + unmount
 remove    = deactivate + lvremove + 删配置
+rebase    = docker_rm + unmount + lvremove（保留配置，需确认）
 sync      = _destroy_all_workspaces + _ensure_base_lv + 重新填充
 unlink    = _destroy_all_workspaces + lvremove(base) + 删配置
 ```
 
-`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync` 和 `unlink` 复用。
+`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync`、`rebase`（不指定 workspace 时）和 `unlink` 复用。
 
 ---
 
@@ -435,3 +451,13 @@ pip install aosp-orch     # 从 PyPI（未来）
 ### enter 自动激活
 
 `enter` 命令在容器未激活时不再直接报错退出，而是询问用户"是否立即激活?"（默认 Y）。确认后自动调用 `activate` 激活，再进入容器 Shell。对 base LV 和 workspace 均适用。
+
+### rebase 命令
+
+`rebase` 用于删除 workspace 快照但保留配置条目，方便下次 `create` 重建。与 `sync` 和 `remove` 的区别：
+
+- **`rebase`**：只删快照 + 保留配置 + 保留 base LV + 需确认
+- **`sync`**：删快照 + 保留配置 + 重新填充 base LV（不删 base LV）
+- **`remove`**：删快照 + 删配置（针对单个 workspace）
+
+`rebase` 支持可选 `workspace_name`：不指定则删除所有 workspace 快照（需确认），指定则只删除该 workspace 快照（需确认）。确认默认为 N，防止误操作。
