@@ -317,6 +317,39 @@ def _destroy_all_workspaces(config: dict, bp: dict) -> None:
             remove_lv(VG_NAME, snapshot_lv_name)
 
 
+def _destroy_lvm_infrastructure(config: dict) -> None:
+    """Destroy all LVM infrastructure: containers, mounts, LVs, VG, loop device.
+
+    Used by init when user chooses to overwrite existing pool image.
+    """
+    # Destroy all workspaces for all base projects
+    for bp in config.get("base_projects", []):
+        _destroy_all_workspaces(config, bp)
+        # Also destroy base LV and default container
+        base = bp["name"]
+        base_lv_name = _base_lv_name(base)
+        c_name = container_name(base, "default")
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        base_mount_path = _base_mount_path(config, base)
+        if is_mounted(base_mount_path):
+            umount(base_mount_path)
+        if lv_exists(VG_NAME, base_lv_name):
+            remove_lv(VG_NAME, base_lv_name)
+
+    # Destroy VG and thin pool
+    if vg_exists(VG_NAME):
+        # Deactivate all LVs first
+        _sudo_run(["lvchange", "-an", f"/dev/{VG_NAME}"], check=False)
+        _sudo_run(["vgremove", "-ff", "-y", VG_NAME], check=False)
+
+    # Detach loop device
+    pool_image_path = _pool_image_path(config)
+    loop_dev = get_loop_device_for_image(pool_image_path)
+    if loop_dev:
+        detach_loop_device(loop_dev)
+
+
 # ── CLI Commands ──────────────────────────────────────────────
 
 @click.group()
@@ -386,8 +419,20 @@ def init(ctx, mode, workdir, pool_image_size_gb):
 
     save_config(config, config_path)
 
-    # Create LVM disk infrastructure: pool image, loop device, VG, thin pool
-    _ensure_pool_and_vg(config)
+    # Check if pool image already exists before creating LVM disk infrastructure
+    pool_image_path = _pool_image_path(config)
+    if os.path.exists(pool_image_path):
+        if not click.confirm(f"\nPool image 已存在: {pool_image_path}\n是否覆盖?（覆盖将销毁所有现有数据）", default=False):
+            click.echo("保留现有 pool image，跳过磁盘创建。")
+        else:
+            # Destroy existing VG/LV/mounts before removing pool image
+            _destroy_lvm_infrastructure(config)
+            _sudo_run(["rm", "-f", pool_image_path])
+            _ensure_pool_and_vg(config)
+            click.echo("Pool image 已覆盖并重新创建。")
+    else:
+        # Create LVM disk infrastructure: pool image, loop device, VG, thin pool
+        _ensure_pool_and_vg(config)
 
     click.echo(f"\n配置已保存到 {config_path}")
     click.echo("  mode            = %s" % g["mode"])
