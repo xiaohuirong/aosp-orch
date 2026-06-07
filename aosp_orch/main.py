@@ -188,6 +188,21 @@ def get_workspace(base_project: dict, ws_name: str) -> dict | None:
     return None
 
 
+def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict]:
+    """Load config, resolve base, and get base project. Returns (config, bp).
+
+    Exits with error if config invalid or base project not found.
+    """
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+    return config, bp
+
+
 def _is_workspace_active(base_project_name: str, ws_name: str) -> bool:
     """Determine workspace active status from Docker (source of truth)."""
     return docker_container_exists(container_name(base_project_name, ws_name))
@@ -248,11 +263,13 @@ def _run_sync(c_name: str, bp: dict) -> None:
         docker_exec(c_name, f"cd /{project_dir} && repo sync")
 
 
-def _populate_base(config: dict, bp: dict) -> None:
+def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
     """Populate base LV with content (mount, fill, unmount).
 
     Base LV must already exist and be formatted. This function mounts it,
     populates it based on mode, writes the marker, and unmounts it.
+
+    If force=True, removes the marker first to force re-population (used by sync).
     """
     mode = config["global"]["mode"]
     project_name = bp["name"]
@@ -263,8 +280,14 @@ def _populate_base(config: dict, bp: dict) -> None:
     # Mount base LV
     activate_lv(VG_NAME, base_lv_name)
     os.makedirs(base_mount_path, exist_ok=True)
-    mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
+    if not is_lv_mounted(VG_NAME, base_lv_name):
+        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
     _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+
+    # Remove marker if forcing re-population
+    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
+    if force and os.path.exists(marker):
+        os.remove(marker)
 
     # Populate
     if mode == "mock":
@@ -288,15 +311,31 @@ def _populate_base(config: dict, bp: dict) -> None:
         docker_rm(c_name)
 
     # Write marker
-    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
     with open(marker, "w") as f:
         f.write("initialized")
 
     # Unmount base LV (snapshots must be taken from unmounted base for consistency)
-    umount(base_mount_path)
+    if is_lv_mounted(VG_NAME, base_lv_name):
+        umount(base_mount_path)
 
 
 # ── Internal helpers for workspace cleanup ──────────────────
+
+def _destroy_workspace(config: dict, base: str, ws_name: str) -> None:
+    """Destroy a single workspace: stop container, unmount, remove snapshot LV.
+
+    Does NOT remove config entry.
+    """
+    c_name = container_name(base, ws_name)
+    if docker_container_exists(c_name):
+        docker_rm(c_name)
+    ws_mount_path = _workspace_mount_path(config, base, ws_name)
+    if is_mounted(ws_mount_path):
+        umount(ws_mount_path)
+    snapshot_lv_name = _snapshot_lv_name(ws_name)
+    if lv_exists(VG_NAME, snapshot_lv_name):
+        remove_lv(VG_NAME, snapshot_lv_name)
+
 
 def _destroy_all_workspaces(config: dict, bp: dict) -> None:
     """Destroy all workspace containers, mounts, and snapshot LVs.
@@ -305,16 +344,7 @@ def _destroy_all_workspaces(config: dict, bp: dict) -> None:
     """
     base = bp["name"]
     for ws in list(bp.get("workspaces", [])):
-        ws_name = ws["name"]
-        c_name = container_name(base, ws_name)
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        ws_mount_path = _workspace_mount_path(config, base, ws_name)
-        if is_mounted(ws_mount_path):
-            umount(ws_mount_path)
-        snapshot_lv_name = _snapshot_lv_name(ws_name)
-        if lv_exists(VG_NAME, snapshot_lv_name):
-            remove_lv(VG_NAME, snapshot_lv_name)
+        _destroy_workspace(config, base, ws["name"])
 
 
 def _destroy_lvm_infrastructure(config: dict) -> None:
@@ -576,13 +606,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
 @click.pass_context
 def new_cmd(ctx, workspace_name, base):
     """创建工作区：写配置 + 创建快照 LV。幂等：workspace 已存在但快照不存在时仅创建快照。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     ws_exists = get_workspace(bp, workspace_name) is not None
 
@@ -601,7 +625,7 @@ def new_cmd(ctx, workspace_name, base):
     if not ws_exists:
         new_ws = {"name": workspace_name}
         bp.setdefault("workspaces", []).append(new_ws)
-        save_config(config, config_path)
+        save_config(config, ctx.obj["config_path"])
     mount_path = _workspace_mount_path(config, base, workspace_name)
     click.echo(f"Workspace '{workspace_name}' created.")
     click.echo(f"  snapshot_lv_name = {_snapshot_lv_name(workspace_name)} (自动生成)")
@@ -614,14 +638,7 @@ def new_cmd(ctx, workspace_name, base):
 @click.pass_context
 def mount_cmd(ctx, workspace_name, base):
     """挂载工作区快照。不指定 workspace 时挂载 base LV。前提：LV 已存在。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -670,14 +687,7 @@ def mount_cmd(ctx, workspace_name, base):
 @click.pass_context
 def unmount_cmd(ctx, workspace_name, base):
     """卸载工作区快照。不指定 workspace 时卸载 base LV。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -719,14 +729,7 @@ def activate(ctx, workspace_name, base):
 
     前提：workspace 已 create，base LV 已 link。
     """
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
     docker_image = bp["docker_image"]
@@ -778,14 +781,7 @@ def enter(ctx, workspace_name, base):
 
     前提：workspace 已 activate。
     """
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -822,14 +818,7 @@ def enter(ctx, workspace_name, base):
 @click.pass_context
 def deactivate(ctx, workspace_name, base):
     """去激活工作区（停容器 + 卸载）。不指定 workspace 时去激活 base LV。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     project_name = bp["name"]
 
@@ -867,14 +856,7 @@ def deactivate(ctx, workspace_name, base):
 @click.pass_context
 def del_cmd(ctx, workspace_name, base):
     """彻底销毁工作区（deactivate + 销毁快照 + 删配置）。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     ws = None
     ws_idx = None
@@ -910,70 +892,22 @@ def del_cmd(ctx, workspace_name, base):
 @click.pass_context
 def sync(ctx, base):
     """基底强制更新（清盘流）：销毁所有工作区快照 + 重新填充 base LV。"""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-    mode = config["global"]["mode"]
+    config, bp = _resolve_bp(ctx, base)
 
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
-
-    project_name = bp["name"]
-    base_lv_name = _base_lv_name(project_name)
-    base_mount_path = _base_mount_path(config, project_name)
-    docker_image = bp["docker_image"]
+    base_lv_name = _base_lv_name(bp["name"])
 
     # 1. Destroy all workspace snapshots and containers (keep config entries)
     _destroy_all_workspaces(config, bp)
 
     # 2. Check base LV exists
     if not lv_exists(VG_NAME, base_lv_name):
-        click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
+        click.echo(f"Base LV '{bp['name']}' 不存在，请先运行 'link --name {bp['name']}'。", err=True)
         sys.exit(1)
 
-    # 3. Mount base LV, remove marker, re-populate
-    activate_lv(VG_NAME, base_lv_name)
-    os.makedirs(base_mount_path, exist_ok=True)
-    if not is_lv_mounted(VG_NAME, base_lv_name):
-        mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
+    # 3. Force re-populate base LV
+    _populate_base(config, bp, force=True)
 
-    # Remove initialization marker to force re-populate
-    marker = os.path.join(base_mount_path, ".aosp_base_initialized")
-    if os.path.exists(marker):
-        os.remove(marker)
-
-    # Re-populate
-    if mode == "mock":
-        if not docker_image_exists(docker_image):
-            docker_build_mock(docker_image)
-        mock_populate_base(base_mount_path)
-    else:
-        build_config = bp.get("build_config", {})
-        c_name = container_name(base, "default")
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        docker_run(c_name, base_mount_path, f"/{base}", docker_image)
-        _run_sync(c_name, bp)
-        for cmd in build_config.get("setup_commands", []):
-            docker_exec(c_name, f"cd /{base} && {cmd}")
-        compile_cmd = build_config.get("compile_command", "")
-        env_vars = build_config.get("env_vars", {})
-        env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
-        if compile_cmd:
-            docker_exec(c_name, f"cd /{base} && {env_str} {compile_cmd}")
-        docker_rm(c_name)
-
-    # Write marker back
-    with open(marker, "w") as f:
-        f.write("initialized")
-
-    # Unmount base LV
-    if is_lv_mounted(VG_NAME, base_lv_name):
-        umount(base_mount_path)
-    click.echo(f"Base project '{base}' synced successfully.")
+    click.echo(f"Base project '{bp['name']}' synced successfully.")
 
 
 @cli.command("remove")
@@ -1067,14 +1001,7 @@ def rebase(ctx, workspace_name, base):
 
     不指定 workspace 时删除该 base 下所有 workspace。需二次确认。
     """
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
-
-    bp = get_base_project(config, base)
-    if bp is None:
-        click.echo(f"Base project '{base}' not found in config", err=True)
-        sys.exit(1)
+    config, bp = _resolve_bp(ctx, base)
 
     if workspace_name is None:
         # All workspaces
@@ -1091,33 +1018,22 @@ def rebase(ctx, workspace_name, base):
     else:
         ws = get_workspace(bp, workspace_name)
         if ws is None:
-            click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
+            click.echo(f"Workspace '{workspace_name}' not found in '{bp['name']}'", err=True)
             sys.exit(1)
         if not click.confirm(f"将删除 workspace '{workspace_name}'，确认?", default=False):
             click.echo("已取消。")
             return
-        c_name = container_name(base, workspace_name)
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        ws_mount_path = _workspace_mount_path(config, base, workspace_name)
-        if is_mounted(ws_mount_path):
-            umount(ws_mount_path)
-        snapshot_lv_name = _snapshot_lv_name(workspace_name)
-        if lv_exists(VG_NAME, snapshot_lv_name):
-            remove_lv(VG_NAME, snapshot_lv_name)
+        _destroy_workspace(config, bp["name"], workspace_name)
         click.echo(f"Workspace '{workspace_name}' 已删除。")
 
-    click.echo(f"Base project '{base}' rebase 完成。下次 create 可重建快照。")
+    click.echo(f"Base project '{bp['name']}' rebase 完成。下次 create 可重建快照。")
 
 
 @cli.command()
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
-def compile(ctx, base):
+def compile_cmd(ctx, base):
     """Alias for sync - re-compile the base."""
-    config_path = ctx.obj["config_path"]
-    config = load_and_validate_config(config_path)
-    base = _resolve_base(config, base)
     ctx.invoke(sync, base=base)
 
 
