@@ -1019,5 +1019,45 @@ def compile_cmd(ctx, base):
     ctx.invoke(sync, base=base)
 
 
+@cli.command()
+@click.pass_context
+def destroy(ctx):
+    """销毁所有资源（容器、LV、VG、pool image）并删除配置文件。需二次确认。"""
+    config_path = ctx.obj["config_path"]
+
+    if not os.path.exists(config_path):
+        click.echo("配置文件不存在，无需销毁。")
+        return
+
+    config = load_config(config_path)
+    workdir = config.get("global", {}).get("workdir", "?")
+    pool_image_path = _pool_image_path(config)
+
+    click.echo("将销毁以下内容：")
+    click.echo(f"  配置文件: {config_path}")
+    click.echo(f"  工作目录: {workdir}")
+    click.echo(f"  Pool image: {pool_image_path}")
+    click.echo("  所有容器、LV、VG、loop device")
+    if not click.confirm("\n确认销毁所有资源? 此操作不可逆!", default=False):
+        click.echo("已取消。")
+        return
+
+    # 1. Destroy all LVM infrastructure (containers, mounts, LVs, VG, loop device)
+    _destroy_lvm_infrastructure(config)
+
+    # 2. Remove pool image
+    if os.path.exists(pool_image_path):
+        _sudo_run(["rm", "-f", pool_image_path])
+
+    # 3. Remove workdir
+    if os.path.isdir(workdir):
+        _sudo_run(["rm", "-rf", workdir])
+
+    # 4. Remove config file
+    os.remove(config_path)
+
+    click.echo("所有资源已销毁。")
+
+
 if __name__ == "__main__":
     cli()

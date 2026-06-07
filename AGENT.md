@@ -268,6 +268,16 @@ aosp-orch rebase <workspace_name> --base <project_name>
 aosp-orch rebase --base <project_name>
 ```
 
+### `destroy` —— 销毁所有资源并删除配置
+
+彻底销毁所有资源：所有容器、LV、VG、loop device、pool image、工作目录，最后删除配置文件。需二次确认（默认 N）。
+
+销毁顺序：`_destroy_lvm_infrastructure`（停容器+卸载+删 LV+删 VG+解绑 loop device）→ 删 pool image → 删工作目录 → 删配置文件。
+
+```bash
+aosp-orch destroy
+```
+
 ---
 
 ## 五、 命令职责与复用
@@ -291,15 +301,16 @@ aosp-orch rebase --base <project_name>
 ### 命令复用关系
 
 ```
-activate  = mount + docker_run
+activate  = mount + _start_container
 deactivate = docker_rm + unmount
 del       = deactivate + lvremove + 删配置
-rebase    = docker_rm + unmount + lvremove（保留配置，需确认）
-sync      = _destroy_all_workspaces + _ensure_base_lv + 重新填充
+rebase    = _destroy_workspace（保留配置，需确认）
+sync      = _destroy_all_workspaces + _populate_base(force=True)
 remove    = _destroy_all_workspaces + lvremove(base) + 删配置
+destroy   = _destroy_lvm_infrastructure + 删 pool image + 删 workdir + 删配置
 ```
 
-`_destroy_all_workspaces` 是内部函数，遍历所有 workspace 执行停容器 + 卸载 + 删快照，被 `sync`、`rebase`（不指定 workspace 时）和 `remove` 复用。
+`_destroy_workspace` 是内部函数，执行停容器 + 卸载 + 删快照（不删配置）。`_destroy_all_workspaces` 遍历所有 workspace 调用 `_destroy_workspace`，被 `sync`、`rebase`（不指定 workspace 时）和 `remove` 复用。
 
 ---
 
@@ -552,3 +563,7 @@ pip install aosp-orch     # 从 PyPI（未来）
 - `link` → `add`（提示信息、注释）
 - `unlink` → `remove`（注释）
 - `create` → `new`（提示信息、docstring、输出消息）
+
+### `destroy` 命令
+
+新增 `destroy` 命令，一键销毁所有资源并删除配置文件。销毁顺序：`_destroy_lvm_infrastructure`（停所有容器 + 卸载 + 删所有 LV + 删 VG + 解绑 loop device）→ 删 pool image → 删工作目录 → 删配置文件。需二次确认（默认 N），确认前显示将销毁的内容清单。
