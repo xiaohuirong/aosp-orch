@@ -20,9 +20,6 @@ from .storage import (
     lv_exists,
     remove_lv,
     activate_lv,
-    deactivate_lv,
-    get_lv_data_percent,
-    get_lv_size_info,
     format_ext4,
     mount,
     umount,
@@ -35,7 +32,6 @@ from .storage import (
     docker_rm,
     docker_container_exists,
     mock_populate_base,
-    mock_compile,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -201,6 +197,22 @@ def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict]:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
     return config, bp
+
+
+def _mount_lv(lv_name: str, mount_path: str) -> None:
+    """Activate LV, mount it, and fix ownership."""
+    activate_lv(VG_NAME, lv_name)
+    os.makedirs(mount_path, exist_ok=True)
+    if not is_lv_mounted(VG_NAME, lv_name):
+        mount(f"/dev/{VG_NAME}/{lv_name}", mount_path)
+    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
+
+
+def _start_container(c_name: str, mount_path: str, project_name: str, docker_image: str) -> None:
+    """Remove existing container if any, then start a new one."""
+    if docker_container_exists(c_name):
+        docker_rm(c_name)
+    docker_run(c_name, mount_path, f"/{project_name}", docker_image, uid=os.getuid(), gid=os.getgid())
 
 
 def _is_workspace_active(base_project_name: str, ws_name: str) -> bool:
@@ -644,17 +656,13 @@ def mount_cmd(ctx, workspace_name, base):
 
     if workspace_name is None:
         # Mount base LV directly
-        base_lv_name = _base_lv_name(project_name)
-        if not lv_exists(VG_NAME, base_lv_name):
+        lv_name = _base_lv_name(project_name)
+        if not lv_exists(VG_NAME, lv_name):
             click.echo(f"Base LV '{base}' 不存在，请先运行 'link --name {base}'。", err=True)
             sys.exit(1)
-        base_mount_path = _base_mount_path(config, project_name)
-        activate_lv(VG_NAME, base_lv_name)
-        os.makedirs(base_mount_path, exist_ok=True)
-        if not is_lv_mounted(VG_NAME, base_lv_name):
-            mount(f"/dev/{VG_NAME}/{base_lv_name}", base_mount_path)
-        _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", base_mount_path])
-        click.echo(f"Base LV '{base}' mounted at {base_mount_path}.")
+        mount_path = _base_mount_path(config, project_name)
+        _mount_lv(lv_name, mount_path)
+        click.echo(f"Base LV '{base}' mounted at {mount_path}.")
         return
 
     ws = get_workspace(bp, workspace_name)
@@ -662,22 +670,13 @@ def mount_cmd(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'create {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
-    snapshot_lv_name = _snapshot_lv_name(workspace_name)
-    if not lv_exists(VG_NAME, snapshot_lv_name):
-        click.echo(f"Snapshot LV '{snapshot_lv_name}' 不存在，请先运行 'create {workspace_name} --base {base}'。", err=True)
+    lv_name = _snapshot_lv_name(workspace_name)
+    if not lv_exists(VG_NAME, lv_name):
+        click.echo(f"Snapshot LV '{lv_name}' 不存在，请先运行 'create {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
-
-    # Activate and mount snapshot
-    activate_lv(VG_NAME, snapshot_lv_name)
-    os.makedirs(mount_path, exist_ok=True)
-    if not is_lv_mounted(VG_NAME, snapshot_lv_name):
-        mount(f"/dev/{VG_NAME}/{snapshot_lv_name}", mount_path)
-
-    # Fix ownership
-    _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
-
+    _mount_lv(lv_name, mount_path)
     click.echo(f"Workspace '{workspace_name}' mounted at {mount_path}.")
 
 
@@ -737,13 +736,8 @@ def activate(ctx, workspace_name, base):
     if workspace_name is None:
         # Activate base LV: mount + start default container
         ctx.invoke(mount_cmd, workspace_name=None, base=base)
-        base_mount_path = _base_mount_path(config, project_name)
-        c_name = container_name(project_name, "default")
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
-        uid = os.getuid()
-        gid = os.getgid()
-        docker_run(c_name, base_mount_path, f"/{project_name}", docker_image, uid=uid, gid=gid)
+        mount_path = _base_mount_path(config, project_name)
+        _start_container(container_name(project_name, "default"), mount_path, project_name, docker_image)
         click.echo(f"Base LV '{base}' activated.")
         return
 
@@ -756,18 +750,12 @@ def activate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' is already active.")
         return
 
-    mount_path = _workspace_mount_path(config, project_name, workspace_name)
-
     # Mount
     ctx.invoke(mount_cmd, workspace_name=workspace_name, base=base)
 
     # Start container
-    c_name = container_name(project_name, workspace_name)
-    if docker_container_exists(c_name):
-        docker_rm(c_name)
-    uid = os.getuid()
-    gid = os.getgid()
-    docker_run(c_name, mount_path, f"/{project_name}", docker_image, uid=uid, gid=gid)
+    mount_path = _workspace_mount_path(config, project_name, workspace_name)
+    _start_container(container_name(project_name, workspace_name), mount_path, project_name, docker_image)
 
     click.echo(f"Workspace '{workspace_name}' activated.")
 
@@ -883,7 +871,7 @@ def del_cmd(ctx, workspace_name, base):
 
     # 3. Remove from config
     bp["workspaces"].pop(ws_idx)
-    save_config(config, config_path)
+    save_config(config, ctx.obj["config_path"])
     click.echo(f"Workspace '{workspace_name}' removed.")
 
 
@@ -917,16 +905,7 @@ def remove_cmd(ctx, base_name):
     """删除 base project（销毁所有工作区 + 销毁 base LV + 删除配置条目）。需二次确认。"""
     config_path = ctx.obj["config_path"]
     config = load_and_validate_config(config_path)
-
-    # Resolve base: argument > default_base
-    if base_name is not None:
-        base = base_name
-    else:
-        base = config.get("global", {}).get("default_base")
-        if not base:
-            click.echo("未指定 base project，且未设置 global.default_base。请提供参数或先 add 一个项目并设为默认。", err=True)
-            sys.exit(1)
-
+    base = base_name or _resolve_base(config, None)
     bp = get_base_project(config, base)
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)

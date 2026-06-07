@@ -120,12 +120,6 @@ def activate_lv(vg_name: str, lv_name: str) -> None:
     logger.info("LV '%s/%s' activated", vg_name, lv_name)
 
 
-def deactivate_lv(vg_name: str, lv_name: str) -> None:
-    """Deactivate a logical volume."""
-    _sudo_run(["lvchange", "-an", f"/dev/{vg_name}/{lv_name}"])
-    logger.info("LV '%s/%s' deactivated", vg_name, lv_name)
-
-
 def get_lv_data_percent(vg_name: str, lv_name: str) -> float:
     """Get the data usage percentage of a thin LV."""
     result = _sudo_run([
@@ -277,13 +271,3 @@ def mock_populate_base(mount_path: str) -> None:
     mock_img = os.path.join(out_dir, "mock_system.img")
     _sudo_run(["fallocate", "-l", "50M", mock_img])
     logger.info("Mock base populated at %s", mount_path)
-
-
-def mock_compile(mount_path: str) -> None:
-    """Simulate compilation in mock mode."""
-    out_dir = os.path.join(mount_path, "out")
-    os.makedirs(out_dir, exist_ok=True)
-    mock_img = os.path.join(out_dir, "mock_system.img")
-    if not os.path.exists(mock_img):
-        _sudo_run(["fallocate", "-l", "50M", mock_img])
-    logger.info("Mock compile done at %s", mount_path)
