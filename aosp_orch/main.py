@@ -1011,6 +1011,58 @@ def unlink(ctx, base):
 
 
 @cli.command()
+@click.argument("workspace_name", required=False)
+@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
+@click.pass_context
+def rebase(ctx, workspace_name, base):
+    """删除 workspace 快照（停容器 + 卸载 + 删快照），保留 base LV 和配置条目。
+
+    不指定 workspace 时删除该 base 下所有 workspace。需二次确认。
+    """
+    config_path = ctx.obj["config_path"]
+    config = load_and_validate_config(config_path)
+    base = _resolve_base(config, base)
+
+    bp = get_base_project(config, base)
+    if bp is None:
+        click.echo(f"Base project '{base}' not found in config", err=True)
+        sys.exit(1)
+
+    if workspace_name is None:
+        # All workspaces
+        ws_list = list(bp.get("workspaces", []))
+        if not ws_list:
+            click.echo("没有 workspace 需要删除。")
+            return
+        ws_names = [ws["name"] for ws in ws_list]
+        if not click.confirm(f"将删除所有 workspace: {', '.join(ws_names)}，确认?", default=False):
+            click.echo("已取消。")
+            return
+        _destroy_all_workspaces(config, bp)
+        click.echo(f"已删除 workspace: {', '.join(ws_names)}")
+    else:
+        ws = get_workspace(bp, workspace_name)
+        if ws is None:
+            click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
+            sys.exit(1)
+        if not click.confirm(f"将删除 workspace '{workspace_name}'，确认?", default=False):
+            click.echo("已取消。")
+            return
+        c_name = container_name(base, workspace_name)
+        if docker_container_exists(c_name):
+            docker_rm(c_name)
+        ws_mount_path = _workspace_mount_path(config, base, workspace_name)
+        if is_mounted(ws_mount_path):
+            umount(ws_mount_path)
+        snapshot_lv_name = _snapshot_lv_name(workspace_name)
+        if lv_exists(VG_NAME, snapshot_lv_name):
+            remove_lv(VG_NAME, snapshot_lv_name)
+        click.echo(f"Workspace '{workspace_name}' 已删除。")
+
+    click.echo(f"Base project '{base}' rebase 完成。下次 create 可重建快照。")
+
+
+@cli.command()
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
 def compile(ctx, base):
