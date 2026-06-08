@@ -378,7 +378,8 @@ base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 ## 七、 测试
 
 ```bash
-python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
+uv sync --group dev
+uv run pytest test_orchestrator.py -v    # 理想情况下必须输出 10 passed
 ```
 
 ### 测试架构
@@ -428,6 +429,8 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 1. 当前用户具备这些命令的执行权限
 2. `sudo` 必须可非交互执行（通常要求免密 sudo）
 3. Docker / LVM / loop device / dmsetup 相关能力可用
+
+推荐使用 `uv sync --group dev` 创建并管理项目虚拟环境，而不是手动 `python -m venv` + `pip install`。日常执行测试建议直接使用 `uv run pytest ...`，这样可以统一 Python 解释器与依赖解析行为。
 
 若环境中 `sudo` 需要密码，则测试会在创建 pool image 的第一步失败，例如：`sudo fallocate -l 2G /tmp/aosp_test_mock/pool.img`。
 
@@ -512,7 +515,14 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 - 新增 `pyproject.toml`，声明依赖（`click`、`pyyaml`）和入口点 `aosp-orch = "aosp_orch.main:cli"`
 - 安装后直接使用 `aosp-orch` 命令，也支持 `python -m aosp_orch`
 
-安装方式：
+安装方式（推荐 uv）：
+```bash
+uv sync                   # 安装运行依赖并创建 .venv
+uv sync --group dev       # 安装开发/测试依赖并创建 .venv
+uv run aosp-orch --help   # 在 uv 管理的虚拟环境中执行 CLI
+```
+
+兼容方式（仍可用，但不再作为首选文档路径）：
 ```bash
 pip install -e .          # 开发模式
 pip install .             # 正式安装
