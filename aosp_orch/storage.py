@@ -267,9 +267,27 @@ def docker_rm(name: str) -> None:
     logger.info("Container '%s' removed", name)
 
 
+def docker_stop(name: str) -> None:
+    """Stop a container if it is running."""
+    _run(["docker", "stop", name], check=False)
+    logger.info("Container '%s' stopped", name)
+
+
+def docker_start(name: str) -> None:
+    """Start an existing container."""
+    _run(["docker", "start", name])
+    logger.info("Container '%s' started", name)
+
+
 def docker_container_exists(name: str) -> bool:
     """Check if a container exists (running or stopped)."""
     result = _run(["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], check=False, capture=True)
+    return name in result.stdout.strip()
+
+
+def docker_container_running(name: str) -> bool:
+    """Check if a container is currently running."""
+    result = _run(["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], check=False, capture=True)
     return name in result.stdout.strip()
 
 

@@ -30,7 +30,10 @@ from .storage import (
     docker_run,
     docker_exec,
     docker_rm,
+    docker_stop,
+    docker_start,
     docker_container_exists,
+    docker_container_running,
     mock_populate_base,
 )
 
@@ -122,11 +125,15 @@ def validate_config(config: dict) -> list[str]:
                 errors.append(f"{prefix}.base_lv_size_gb must be a positive number")
             if "username" in bp and (not isinstance(bp["username"], str) or not bp["username"].strip()):
                 errors.append(f"{prefix}.username must be a non-empty string")
+            if "default_container" in bp and (not isinstance(bp["default_container"], str) or not bp["default_container"].strip()):
+                errors.append(f"{prefix}.default_container must be a non-empty string")
             # Check workspaces structure
             for j, ws in enumerate(bp.get("workspaces", [])):
                 ws_prefix = f"{prefix}.workspaces[{j}]" + (f"({ws.get('name', '?')})" if "name" in ws else "")
                 if "name" not in ws:
                     errors.append(f"Missing {ws_prefix}.name")
+                if "container" in ws and (not isinstance(ws["container"], str) or not ws["container"].strip()):
+                    errors.append(f"{ws_prefix}.container must be a non-empty string")
 
     return errors
 
@@ -199,6 +206,46 @@ def get_workspace(base_project: dict, ws_name: str) -> dict | None:
     return None
 
 
+def _default_container_name_for_bp(bp: dict) -> str:
+    """Resolve persisted default container name for a base project."""
+    return bp.get("default_container") or container_name(bp["name"], "default")
+
+
+def _workspace_container_name(bp: dict, ws_name: str) -> str:
+    """Resolve persisted workspace container name."""
+    ws = get_workspace(bp, ws_name)
+    if ws and ws.get("container"):
+        return ws["container"]
+    return container_name(bp["name"], ws_name)
+
+
+def _ensure_default_container_record(bp: dict) -> bool:
+    """Ensure base project's default container name is persisted in config."""
+    c_name = _default_container_name_for_bp(bp)
+    if bp.get("default_container") == c_name:
+        return False
+    bp["default_container"] = c_name
+    return True
+
+
+def _ensure_workspace_container_record(bp: dict, ws: dict) -> bool:
+    """Ensure workspace container name is persisted in config."""
+    c_name = ws.get("container") or container_name(bp["name"], ws["name"])
+    if ws.get("container") == c_name:
+        return False
+    ws["container"] = c_name
+    return True
+
+
+def _persist_container_records(config: dict, bp: dict, config_path: str) -> None:
+    """Persist container names into config when missing."""
+    changed = _ensure_default_container_record(bp)
+    for ws in bp.get("workspaces", []):
+        changed = _ensure_workspace_container_record(bp, ws) or changed
+    if changed:
+        save_config(config, config_path)
+
+
 def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict, str]:
     """Load config, resolve base, and get base project. Returns (config, bp, base).
 
@@ -211,6 +258,7 @@ def _resolve_bp(ctx, base: str | None) -> tuple[dict, dict, str]:
     if bp is None:
         click.echo(f"Base project '{base}' not found in config", err=True)
         sys.exit(1)
+    _persist_container_records(config, bp, config_path)
     return config, bp, base
 
 
@@ -224,9 +272,11 @@ def _mount_lv(lv_name: str, mount_path: str) -> None:
 
 
 def _start_container(bp: dict, c_name: str, mount_path: str, project_name: str, docker_image: str) -> None:
-    """Remove existing container if any, then start a new one."""
+    """Start persisted container if it exists, otherwise create it once."""
     if docker_container_exists(c_name):
-        docker_rm(c_name)
+        if not docker_container_running(c_name):
+            docker_start(c_name)
+        return
     docker_run(
         c_name,
         mount_path,
@@ -238,9 +288,14 @@ def _start_container(bp: dict, c_name: str, mount_path: str, project_name: str, 
     )
 
 
-def _is_workspace_active(base_project_name: str, ws_name: str) -> bool:
-    """Determine workspace active status from Docker (source of truth)."""
-    return docker_container_exists(container_name(base_project_name, ws_name))
+def _is_workspace_active(bp: dict, ws_name: str) -> bool:
+    """Determine workspace active status from whether its persisted container is running."""
+    return docker_container_running(_workspace_container_name(bp, ws_name))
+
+
+def _is_base_active(bp: dict) -> bool:
+    """Determine base LV active status from whether default container is running."""
+    return docker_container_running(_default_container_name_for_bp(bp))
 
 
 def container_name(base_project_name: str, ws_name: str) -> str:
@@ -331,7 +386,7 @@ def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
         mock_populate_base(base_mount_path)
     else:
         build_config = bp.get("build_config", {})
-        c_name = container_name(project_name, "default")
+        c_name = _default_container_name_for_bp(bp)
         if docker_container_exists(c_name):
             docker_rm(c_name)
         docker_run(
@@ -369,7 +424,8 @@ def _destroy_workspace(config: dict, base: str, ws_name: str) -> None:
 
     Does NOT remove config entry.
     """
-    c_name = container_name(base, ws_name)
+    bp = get_base_project(config, base)
+    c_name = _workspace_container_name(bp, ws_name) if bp is not None else container_name(base, ws_name)
     if docker_container_exists(c_name):
         docker_rm(c_name)
     ws_mount_path = _workspace_mount_path(config, base, ws_name)
@@ -401,7 +457,7 @@ def _destroy_lvm_infrastructure(config: dict) -> None:
         # Also destroy base LV and default container
         base = bp["name"]
         base_lv_name = _base_lv_name(base)
-        c_name = container_name(base, "default")
+        c_name = _default_container_name_for_bp(bp)
         if docker_container_exists(c_name):
             docker_rm(c_name)
         base_mount_path = _base_mount_path(config, base)
@@ -607,6 +663,8 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
         bp["username"] = click.prompt("容器 USERNAME", default=bp["username"])
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
 
+    _ensure_default_container_record(bp)
+
     # Ask if this should be the default base project
     current_default = g.get("default_base")
     if current_default == bp_name:
@@ -678,6 +736,7 @@ def new_cmd(ctx, workspace_name, base):
     # Write config if workspace doesn't exist yet
     if not ws_exists:
         new_ws = {"name": workspace_name}
+        _ensure_workspace_container_record(bp, new_ws)
         bp.setdefault("workspaces", []).append(new_ws)
         save_config(config, ctx.obj["config_path"])
     mount_path = _workspace_mount_path(config, base, workspace_name)
@@ -779,7 +838,7 @@ def activate(ctx, workspace_name, base):
         # Activate base LV: mount + start default container
         ctx.invoke(mount_cmd, workspace_name=None, base=base)
         mount_path = _base_mount_path(config, project_name)
-        _start_container(bp, container_name(project_name, "default"), mount_path, project_name, docker_image)
+        _start_container(bp, _default_container_name_for_bp(bp), mount_path, project_name, docker_image)
         click.echo(f"Base LV '{base}' activated.")
         return
 
@@ -788,7 +847,7 @@ def activate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' not found in '{base}'，请先运行 'new {workspace_name} --base {base}'。", err=True)
         sys.exit(1)
 
-    if _is_workspace_active(base, workspace_name):
+    if _is_workspace_active(bp, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already active.")
         return
 
@@ -797,7 +856,7 @@ def activate(ctx, workspace_name, base):
 
     # Start container
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
-    _start_container(bp, container_name(project_name, workspace_name), mount_path, project_name, docker_image)
+    _start_container(bp, _workspace_container_name(bp, workspace_name), mount_path, project_name, docker_image)
 
     click.echo(f"Workspace '{workspace_name}' activated.")
 
@@ -816,13 +875,13 @@ def enter(ctx, workspace_name, base):
     project_name = bp["name"]
 
     if workspace_name is None:
-        c_name = container_name(project_name, "default")
-        if not docker_container_exists(c_name):
+        c_name = _default_container_name_for_bp(bp)
+        if not docker_container_running(c_name):
             if click.confirm(f"Base LV '{base}' 未激活，是否立即激活?", default=True):
                 ctx.invoke(activate, workspace_name=None, base=base)
             else:
                 sys.exit(1)
-        os.execvp("docker", ["docker", "exec", "-it", container_name(project_name, "default"), "/bin/sh"])
+        os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
         return
 
     ws = get_workspace(bp, workspace_name)
@@ -832,13 +891,13 @@ def enter(ctx, workspace_name, base):
         else:
             sys.exit(1)
 
-    if not _is_workspace_active(base, workspace_name):
+    if not _is_workspace_active(bp, workspace_name):
         if click.confirm(f"Workspace '{workspace_name}' 未激活，是否立即激活?", default=True):
             ctx.invoke(activate, workspace_name=workspace_name, base=base)
         else:
             sys.exit(1)
 
-    c_name = container_name(bp["name"], workspace_name)
+    c_name = _workspace_container_name(bp, workspace_name)
     os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh"])
 
 
@@ -853,9 +912,9 @@ def deactivate(ctx, workspace_name, base):
     project_name = bp["name"]
 
     if workspace_name is None:
-        c_name = container_name(project_name, "default")
-        if docker_container_exists(c_name):
-            docker_rm(c_name)
+        c_name = _default_container_name_for_bp(bp)
+        if docker_container_running(c_name):
+            docker_stop(c_name)
         ctx.invoke(unmount_cmd, workspace_name=None, base=base)
         click.echo(f"Base LV '{base}' deactivated.")
         return
@@ -865,14 +924,14 @@ def deactivate(ctx, workspace_name, base):
         click.echo(f"Workspace '{workspace_name}' not found in '{base}'", err=True)
         sys.exit(1)
 
-    if not _is_workspace_active(base, workspace_name):
+    if not _is_workspace_active(bp, workspace_name):
         click.echo(f"Workspace '{workspace_name}' is already inactive.")
         return
 
-    # 1. Stop and remove container
-    c_name = container_name(bp["name"], workspace_name)
-    if docker_container_exists(c_name):
-        docker_rm(c_name)
+    # 1. Stop persisted container
+    c_name = _workspace_container_name(bp, workspace_name)
+    if docker_container_running(c_name):
+        docker_stop(c_name)
 
     # 2. Unmount
     ctx.invoke(unmount_cmd, workspace_name=workspace_name, base=base)
@@ -901,7 +960,7 @@ def del_cmd(ctx, workspace_name, base):
         sys.exit(1)
 
     # 1. Deactivate if active
-    if _is_workspace_active(base, workspace_name):
+    if _is_workspace_active(bp, workspace_name):
         ctx.invoke(deactivate, workspace_name=workspace_name, base=base)
     elif is_mounted(_workspace_mount_path(config, bp["name"], workspace_name)):
         ctx.invoke(unmount_cmd, workspace_name=workspace_name, base=base)
@@ -963,6 +1022,9 @@ def remove_cmd(ctx, base_name):
     # 2. Destroy base LV
     base_lv_name = _base_lv_name(base)
     base_mount_path = _base_mount_path(config, base)
+    default_c_name = _default_container_name_for_bp(bp)
+    if docker_container_exists(default_c_name):
+        docker_rm(default_c_name)
     if is_mounted(base_mount_path):
         umount(base_mount_path)
     if lv_exists(VG_NAME, base_lv_name):

@@ -25,6 +25,7 @@ from aosp_orch.storage import (
     is_mounted,
     is_lv_mounted,
     docker_container_exists,
+    docker_container_running,
     get_lv_data_percent,
     get_lv_size_info,
     remove_lv,
@@ -378,8 +379,8 @@ class TestAssertion2SnapshotIsolation:
 class TestAssertion3DeactivationIdempotency:
     """断言 3: 去激活幂等性验证"""
 
-    def test_deactivate_unmounts_and_removes_container(self, mock_config_path):
-        """After deactivate, snapshot LV must be unmounted and container removed."""
+    def test_deactivate_unmounts_and_stops_container(self, mock_config_path):
+        """After deactivate, snapshot LV must be unmounted and container stopped but preserved."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
@@ -388,6 +389,8 @@ class TestAssertion3DeactivationIdempotency:
         # Verify it's active
         assert docker_container_exists("aosp_xxx_a"), \
             "Container aosp_xxx_a should exist after activate"
+        assert docker_container_running("aosp_xxx_a"), \
+            "Container aosp_xxx_a should be running after activate"
 
         # Deactivate
         result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
@@ -398,9 +401,39 @@ class TestAssertion3DeactivationIdempotency:
         assert "s-a" not in mount_result.stdout, \
             f"s-a still mounted after deactivate"
 
-        # Assert: Docker container must not exist
-        assert not docker_container_exists("aosp_xxx_a"), \
-            "Container aosp_xxx_a still exists after deactivate"
+        # Assert: Docker container should still exist but be stopped
+        assert docker_container_exists("aosp_xxx_a"), \
+            "Container aosp_xxx_a should be preserved after deactivate"
+        assert not docker_container_running("aosp_xxx_a"), \
+            "Container aosp_xxx_a should be stopped after deactivate"
+
+    def test_reactivate_reuses_persisted_container(self, mock_config_path):
+        """Re-activate should reuse the persisted container instead of creating a new one."""
+        _link_xxx(mock_config_path)
+        run_cli(mock_config_path, "new", "a", "--base", "xxx")
+
+        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        assert result.returncode == 0, f"first activate failed: {result.stderr}"
+
+        config = read_config(mock_config_path)
+        ws = config["base_projects"][0]["workspaces"][0]
+        assert ws.get("container") == "aosp_xxx_a", "workspace container should be persisted in config"
+
+        inspect_before = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx_a"])
+        assert inspect_before.returncode == 0, f"inspect before failed: {inspect_before.stderr}"
+        container_id_before = inspect_before.stdout.strip()
+
+        result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
+        assert result.returncode == 0, f"deactivate failed: {result.stderr}"
+
+        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        assert result.returncode == 0, f"second activate failed: {result.stderr}"
+
+        inspect_after = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx_a"])
+        assert inspect_after.returncode == 0, f"inspect after failed: {inspect_after.stderr}"
+        container_id_after = inspect_after.stdout.strip()
+
+        assert container_id_before == container_id_after, "container should be reused instead of recreated"
 
 
 class TestAssertion4ForceSync:

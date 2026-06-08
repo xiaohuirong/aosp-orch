@@ -44,6 +44,7 @@ base_projects:
     repo_branch: main
     docker_image: aosp-builder:mock
     username: user
+    default_container: aosp_xxx_default
     base_lv_size_gb: 1
     build_config:
       setup_commands:
@@ -54,6 +55,7 @@ base_projects:
         USE_CCACHE: "1"
     workspaces:
       - name: a
+        container: aosp_xxx_a
 ```
 
 ### 设计原则：配置文件只存用户需要关心的内容
@@ -73,7 +75,15 @@ base_projects:
 | snapshot_lv_name | `s-{workspace}` | `s-a` |
 | workspace mount | `{workdir}/{project}/{workspace}` | `/tmp/aosp_workspaces/xxx/a` |
 
-**workspace 状态不存配置**：active/inactive 由 `docker_container_exists` 实时判断，配置文件中 workspace 只有 `name` 字段。
+**workspace 运行状态不存配置**：active/inactive 不落盘，运行态由 Docker 实时判断；但为了支持容器持久化与复用，配置文件会记录最小必要的容器名元数据：
+
+- `base_projects[].default_container`：base LV 对应默认容器名
+- `base_projects[].workspaces[].container`：workspace 对应容器名
+
+当前语义为：
+
+- **active** = 对应容器正在运行
+- **inactive** = 对应容器已停止，或尚未创建/已被销毁
 
 **base_project 级 Docker 用户配置**：`USERNAME` 不放在 `global`，而是放在 `base_projects[].username`。原因是不同 base project 往往对应不同镜像/容器初始化脚本，所需用户名可能不同。容器启动时优先读取该字段，并通过 `-e USERNAME=...` 注入容器；未配置时当前默认值固定为 `user`（不再跟随宿主机 `USER/USERNAME`）。
 
@@ -102,7 +112,7 @@ base_projects:
 `mount`、`unmount`、`activate`、`deactivate`、`enter` 这 5 个命令的 `workspace_name` 参数为**可选**：
 
 - **指定 workspace_name** → 操作该 workspace 的快照卷
-- **不指定 workspace_name** → 操作 base LV 本身（挂载到 `base_mount`，容器名为 `{project}_default`）
+- **不指定 workspace_name** → 操作 base LV 本身（挂载到 `base_mount`，默认容器名为 `aosp_{project}_default`）
 
 `new` 和 `del` 的 `workspace_name` 仍为必填，因为它们只针对 workspace 操作。
 
@@ -193,9 +203,15 @@ aosp-orch unmount <workspace_name> --base <project_name>
 aosp-orch unmount --base <project_name>
 ```
 
-### `activate` —— 激活（mount + 启动容器）
+### `activate` —— 激活（mount + 启动/复用容器）
 
 挂载 + 启动容器。不指定 workspace 时激活 base LV（挂载 + 启动 default 容器）。
+
+若配置中记录的容器已存在，则：
+
+- **容器运行中** → 直接复用，不重复创建
+- **容器已停止** → `docker start` 拉起
+- **容器不存在** → 首次 `docker run` 创建
 
 前提：workspace 已 `new`，base LV 已 `add`。
 
@@ -223,7 +239,7 @@ aosp-orch enter --base <project_name>
 
 ### `deactivate` —— 去激活（停容器 + 卸载）
 
-停容器、卸载，数据保留在快照卷/base LV 中。幂等操作（已 inactive 时安全返回）。
+停止容器、卸载，数据保留在快照卷/base LV 中。**默认不删除容器**，以便后续 `activate` 直接复用。幂等操作（已 inactive 时安全返回）。
 
 ```bash
 # 去激活 workspace
@@ -291,7 +307,7 @@ aosp-orch destroy
 - **`add`** → 创建 base LV + 格式化 + 填充内容（前提：`init` 已创建磁盘）
 - **`new`** → 创建快照 LV（前提：base LV 已通过 `add` 创建）
 - **`mount`** → 激活 LV + 挂载 + 修复权限（前提：LV 已存在）
-- **`activate`** = `mount` + 启动容器
+- **`activate`** = `mount` + 启动/复用容器
 - **`deactivate`** = 停容器 + `unmount`
 - **`sync`** = `_destroy_all_workspaces` + 重新填充 base LV
 - **`rebase`** = 删除指定/所有 workspace 快照（保留配置，需确认）
@@ -305,7 +321,7 @@ aosp-orch destroy
 
 ```
 activate  = mount + _start_container
-deactivate = docker_rm + unmount
+deactivate = docker_stop + unmount
 del       = deactivate + lvremove + 删配置
 rebase    = _destroy_workspace（保留配置，需确认）
 sync      = _destroy_all_workspaces + _populate_base(force=True)
@@ -325,7 +341,12 @@ LVM 卷组名、精简池名、所有 LV 名和挂载路径均由代码自动推
 
 ### workspace 状态判断
 
-workspace 的 active/inactive 状态**不存储在配置文件中**，而是通过 `docker_container_exists(container_name)` 实时判断。容器存在 = active，容器不存在 = inactive。这避免了配置与实际状态不同步的问题。
+workspace 的 active/inactive 状态**不存储在配置文件中**，而是通过 Docker 实时判断：
+
+- `docker_container_running(container)` 为真 → active
+- 容器已停止、尚未创建或已销毁 → inactive
+
+配置文件只持久化容器名，不持久化运行态。这避免了状态字段与真实运行状态不同步的问题，同时保留了容器复用所需的信息。
 
 ### LVM Thin Snapshot 激活
 
@@ -336,6 +357,19 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 容器启动时会注入 `UID`、`GID`、`USERNAME` 三个环境变量，便于镜像内的 `entrypoint.sh` 根据宿主用户信息创建用户、修复 home 目录权限、配置 sudo/gosu 等。
 
 当前实现中，`USERNAME` 的默认值固定为 `user`。这样测试、CLI 非交互调用以及不同宿主机环境下的行为更稳定，不会因为本机用户名不同而导致容器内初始化行为漂移。
+
+当前实现支持**实例容器持久化**：
+
+- `add` / `_resolve_bp` 会确保 base project 和 workspace 在配置中有稳定的容器名记录
+- `activate` 不再无脑删旧容器重建，而是优先复用已记录的容器
+- `deactivate` 只做 `docker stop`，不做 `docker rm`
+- `del` / `rebase` / `sync` / `remove` / `destroy` 这类真正销毁资源的命令，才会删除容器
+
+这样做的好处是：
+
+- 避免频繁重建容器导致的启动成本和上下文丢失
+- 对同一 workspace/base LV，容器身份稳定，可直接 `start/stop`
+- 配置文件成为“LV ↔ 容器实例”映射的权威来源之一，便于后续 AI 或人工排障
 
 **重要：不要覆盖镜像自带 ENTRYPOINT。**
 
@@ -373,6 +407,8 @@ base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
 
 `sync` 命令只销毁快照卷和容器（物理资源），**保留配置文件中的 workspace 条目**。用户下次需先 `new` 重建快照再 `activate`，无需重新在配置中添加 workspace。
 
+注意：`sync` 会销毁 workspace 对应的物理容器实例；但配置中的 workspace 名和容器名字段仍可保留，后续重新 `new` + `activate` 时若容器不存在会按同名重新创建。
+
 ---
 
 ## 七、 测试
@@ -391,14 +427,15 @@ uv run pytest test_orchestrator.py -v    # 理想情况下必须输出 10 passed
 - Mock 测试：workdir = `/tmp/aosp_test_mock`，项目名 `xxx`，Docker 镜像 `aosp-builder:mock`
 - Prod/Git 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`，sync_type = git
 
-### 10 个测试用例
+### 11 个测试用例
 
 | 类 | 用例 | 验证内容 |
 |---|---|---|
 | 断言1 | `test_link_writes_config_and_creates_infrastructure` | add 写入配置 + 创建 LVM 基础设施 |
 | 断言1 | `test_link_creates_base_lv_with_mock_output` | add 创建 base LV 含 mock 产物 |
 | 断言2 | `test_workspace_isolation` | 工作区 a 写入的文件在 b 中不可见（块设备级物理隔离） |
-| 断言3 | `test_deactivate_unmounts_and_removes_container` | deactivate 后快照已卸载、容器已删除 |
+| 断言3 | `test_deactivate_unmounts_and_stops_container` | deactivate 后快照已卸载、容器仍存在但处于停止状态 |
+| 断言3 | `test_reactivate_reuses_persisted_container` | 再次 activate 复用原容器，不重新创建实例 |
 | 断言4 | `test_sync_destroys_workspaces_and_refreshes_base` | sync 销毁所有快照 + 配置保留 + 需重新 new 再 activate |
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
@@ -480,7 +517,28 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 
 ### workspace 状态不同步
 
-原方案将 `status: active/inactive` 存入配置文件，容易与实际状态不一致。改为通过 `docker_container_exists()` 实时判断，配置文件中 workspace 只保留 `name` 字段。
+原方案将 `status: active/inactive` 存入配置文件，容易与实际状态不一致。后来又进一步演进为：
+
+- 运行态仍不入配置
+- active/inactive 通过容器**是否正在运行**实时判断
+- 但配置中保留 `default_container` / `container` 字段，用于持久化容器实例映射
+
+这样既避免状态漂移，又支持容器复用。
+
+### 容器重复创建导致上下文丢失
+
+早期 `activate` 的实现倾向于“发现同名容器就删掉重建”，这会带来两个问题：
+
+- 容器 ID 每次变化，不利于排障和跟踪
+- `deactivate` 后再次 `activate` 会重复创建实例，丢失容器级上下文
+
+现方案改为：
+
+- 配置文件持久化 base/workspace 对应容器名
+- `deactivate` 只 stop，不 rm
+- `activate` 优先 start 已有容器，不存在时才 create
+
+这样更符合“实例容器持久化”的预期。
 
 ### 测试清理 "filesystem in use"
 
@@ -500,7 +558,7 @@ git clone 目标目录已存在时会失败。解决方案：clone 到 `/{projec
 
 ### 无 workspace 时操作 base LV
 
-用户经常需要直接操作 base LV（查看源码、手动编译等），之前必须创建一个 workspace。解决：`mount`/`unmount`/`activate`/`deactivate`/`enter` 的 `workspace_name` 改为可选，不传时操作 base LV 本身，容器名为 `{project}_default`。
+用户经常需要直接操作 base LV（查看源码、手动编译等），之前必须创建一个 workspace。解决：`mount`/`unmount`/`activate`/`deactivate`/`enter` 的 `workspace_name` 改为可选，不传时操作 base LV 本身，默认容器名为 `aosp_{project}_default`。
 
 ### init 创建 LVM 磁盘
 
