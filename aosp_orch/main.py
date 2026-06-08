@@ -124,7 +124,7 @@ def validate_config(config: dict) -> list[str]:
     else:
         for i, bp in enumerate(bps):
             prefix = f"base_projects[{i}]" + (f"({bp.get('name', '?')})" if "name" in bp else "")
-            for key in ("name", "repo_url", "repo_branch", "docker_image", "base_lv_size_gb"):
+            for key in ("name", "docker_image", "base_lv_size_gb"):
                 if key not in bp:
                     errors.append(f"Missing {prefix}.{key}")
             if "base_lv_size_gb" in bp and (not isinstance(bp["base_lv_size_gb"], (int, float)) or bp["base_lv_size_gb"] <= 0):

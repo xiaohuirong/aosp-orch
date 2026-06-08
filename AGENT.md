@@ -40,19 +40,10 @@ global:
 
 base_projects:
   - name: xxx
-    repo_url: https://github.com/mock/manifest.git
-    repo_branch: main
     docker_image: aosp-builder:mock
     username: user
     default_container: aosp_xxx
     base_lv_size_gb: 1
-    build_config:
-      setup_commands:
-        - source build/envsetup.sh
-        - lunch mock_target-eng
-      compile_command: m -j$(nproc)
-      env_vars:
-        USE_CCACHE: "1"
     workspaces:
       - name: a
 ```
