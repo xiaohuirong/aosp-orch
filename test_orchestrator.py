@@ -355,7 +355,7 @@ class TestAssertion2SnapshotIsolation:
         # Create, mount and activate workspace a
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Write ai_code.txt in workspace a path inside the shared product container
@@ -370,7 +370,7 @@ class TestAssertion2SnapshotIsolation:
         # Create, mount and activate workspace b
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
         run_cli(mock_config_path, "mount", "b", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # ASSERT ai_code.txt must NOT exist in workspace b
@@ -387,7 +387,7 @@ class TestAssertion3DeactivationIdempotency:
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Verify it's active
@@ -397,7 +397,7 @@ class TestAssertion3DeactivationIdempotency:
             "Container aosp_xxx should be running after activate"
 
         # Deactivate
-        result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "stop", "a", "--base", "xxx")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
         # Assert: mount remains because deactivate no longer unmounts
@@ -417,7 +417,7 @@ class TestAssertion3DeactivationIdempotency:
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
 
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"first activate failed: {result.stderr}"
 
         config = read_config(mock_config_path)
@@ -428,10 +428,10 @@ class TestAssertion3DeactivationIdempotency:
         assert inspect_before.returncode == 0, f"inspect before failed: {inspect_before.stderr}"
         container_id_before = inspect_before.stdout.strip()
 
-        result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "stop", "a", "--base", "xxx")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"second activate failed: {result.stderr}"
 
         inspect_after = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx"])
@@ -450,12 +450,12 @@ class TestAssertion4ForceSync:
         # Setup: create + activate a and b
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
         run_cli(mock_config_path, "mount", "b", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # Write something in b to make it dirty
@@ -482,7 +482,7 @@ class TestAssertion4ForceSync:
         # Re-create b (snapshot was destroyed by sync, config entry kept) then activate
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
         run_cli(mock_config_path, "mount", "b", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
         # Assert: s-b is recreated
@@ -503,7 +503,7 @@ class TestSnapshotSpaceSaving:
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         data_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
@@ -515,7 +515,7 @@ class TestSnapshotSpaceSaving:
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         initial_pct = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
@@ -539,7 +539,7 @@ class TestSnapshotSpaceSaving:
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
         run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        run_cli(mock_config_path, "activate", "a", "--base", "xxx")
+        run_cli(mock_config_path, "start", "a", "--base", "xxx")
 
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
         run_cli(mock_config_path, "mount", "b", "--base", "xxx")
@@ -573,7 +573,7 @@ class TestGitSync:
         self._link_aosp(prod_config_path)
         run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
         run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
-        result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
+        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         # Verify git-repo directory exists and has .git
@@ -591,15 +591,15 @@ class TestGitSync:
         self._link_aosp(prod_config_path)
         run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
         run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
-        result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
+        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"first activate failed: {result.stderr}"
 
         # Deactivate
-        result = run_cli(prod_config_path, "deactivate", "feature-a", "--base", "aosp")
+        result = run_cli(prod_config_path, "stop", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
         # Re-activate: should simply start the shared product container again
-        result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
+        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"re-activate failed: {result.stderr}"
 
         # Verify git-repo still intact

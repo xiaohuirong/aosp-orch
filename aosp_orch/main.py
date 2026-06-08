@@ -800,7 +800,7 @@ def new_cmd(ctx, workspace_name, base):
     click.echo(f"  mount_path        = {mount_path} (自动生成)")
 
 
-@cli.command()
+@cli.command("mount")
 @click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
@@ -838,7 +838,7 @@ def mount_cmd(ctx, workspace_name, base):
     click.echo(f"Workspace '{workspace_name}' mounted at {mount_path}.")
 
 
-@cli.command()
+@cli.command("unmount")
 @click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
@@ -877,11 +877,11 @@ def unmount_cmd(ctx, workspace_name, base):
     click.echo(f"Workspace '{workspace_name}' unmounted.")
 
 
-@cli.command()
+@cli.command("start")
 @click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
-def activate(ctx, workspace_name, base):
+def start_cmd(ctx, workspace_name, base):
     """激活工作区。当前语义为启动 product 级共享容器。
 
     前提：workspace 已 new，base LV 已 add。
@@ -931,7 +931,7 @@ def enter(ctx, workspace_name, base):
             ctx.invoke(mount_cmd, workspace_name=None, base=base)
         if not docker_container_running(c_name):
             if click.confirm(f"Base LV '{base}' 未激活，是否立即激活?", default=True):
-                ctx.invoke(activate, workspace_name=None, base=base)
+                ctx.invoke(start_cmd, workspace_name=None, base=base)
             else:
                 sys.exit(1)
         os.makedirs(base_mount_path, exist_ok=True)
@@ -954,7 +954,7 @@ def enter(ctx, workspace_name, base):
 
     if not _is_workspace_active(bp, workspace_name):
         if click.confirm(f"Workspace '{workspace_name}' 未激活，是否立即激活?", default=True):
-            ctx.invoke(activate, workspace_name=workspace_name, base=base)
+            ctx.invoke(start_cmd, workspace_name=workspace_name, base=base)
         else:
             sys.exit(1)
 
@@ -963,11 +963,11 @@ def enter(ctx, workspace_name, base):
     os.execvp("docker", ["docker", "exec", "-it", c_name, "/bin/sh", "-c", f"cd {target_path} && exec /bin/sh"])
 
 
-@cli.command()
+@cli.command("stop")
 @click.argument("workspace_name", required=False)
 @click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
 @click.pass_context
-def deactivate(ctx, workspace_name, base):
+def stop_cmd(ctx, workspace_name, base):
     """去激活工作区。当前语义为停止 product 级共享容器。"""
     config, bp, base = _resolve_bp(ctx, base)
     c_name = _default_container_name_for_bp(bp)
