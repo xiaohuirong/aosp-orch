@@ -1,5 +1,6 @@
 """AOSP Block Device Build Container Orchestrator - CLI Entry Point."""
 
+import getpass
 import sys
 import os
 import logging
@@ -120,6 +121,8 @@ def validate_config(config: dict) -> list[str]:
                     errors.append(f"Missing {prefix}.{key}")
             if "base_lv_size_gb" in bp and (not isinstance(bp["base_lv_size_gb"], (int, float)) or bp["base_lv_size_gb"] <= 0):
                 errors.append(f"{prefix}.base_lv_size_gb must be a positive number")
+            if "username" in bp and (not isinstance(bp["username"], str) or not bp["username"].strip()):
+                errors.append(f"{prefix}.username must be a non-empty string")
             # Check workspaces structure
             for j, ws in enumerate(bp.get("workspaces", [])):
                 ws_prefix = f"{prefix}.workspaces[{j}]" + (f"({ws.get('name', '?')})" if "name" in ws else "")
@@ -141,6 +144,19 @@ def _resolve_base(config: dict, base: str | None) -> str:
         return default_base
     click.echo("未指定 --base 参数，且未设置 global.default_base。请使用 --base 或先 add 一个项目并设为默认。", err=True)
     sys.exit(1)
+
+
+def _default_username() -> str:
+    """Resolve default container username from env/current user."""
+    return os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
+
+
+def _container_username(bp: dict) -> str:
+    """Resolve container USERNAME from base project, falling back to current user."""
+    username = bp.get("username")
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+    return _default_username()
 
 
 def load_and_validate_config(config_path: str) -> dict:
@@ -208,11 +224,19 @@ def _mount_lv(lv_name: str, mount_path: str) -> None:
     _sudo_run(["chown", "-R", f"{os.getuid()}:{os.getgid()}", mount_path])
 
 
-def _start_container(c_name: str, mount_path: str, project_name: str, docker_image: str) -> None:
+def _start_container(bp: dict, c_name: str, mount_path: str, project_name: str, docker_image: str) -> None:
     """Remove existing container if any, then start a new one."""
     if docker_container_exists(c_name):
         docker_rm(c_name)
-    docker_run(c_name, mount_path, f"/{project_name}", docker_image, uid=os.getuid(), gid=os.getgid())
+    docker_run(
+        c_name,
+        mount_path,
+        f"/{project_name}",
+        docker_image,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        username=_container_username(bp),
+    )
 
 
 def _is_workspace_active(base_project_name: str, ws_name: str) -> bool:
@@ -311,7 +335,15 @@ def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
         c_name = container_name(project_name, "default")
         if docker_container_exists(c_name):
             docker_rm(c_name)
-        docker_run(c_name, base_mount_path, f"/{project_name}", docker_image)
+        docker_run(
+            c_name,
+            base_mount_path,
+            f"/{project_name}",
+            docker_image,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            username=_container_username(bp),
+        )
         _run_sync(c_name, bp)
         for cmd in build_config.get("setup_commands", []):
             docker_exec(c_name, f"cd /{project_name} && {cmd}")
@@ -493,11 +525,12 @@ def init(ctx, mode, workdir, pool_image_size_gb):
 @click.option("--repo-url", default=None, help="远程清单仓库地址")
 @click.option("--repo-branch", default=None, help="清单仓库分支")
 @click.option("--docker-image", default=None, help="Docker 镜像名称")
+@click.option("--username", default=None, help="该 base project 对应容器注入的 USERNAME 环境变量")
 @click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
 @click.option("--sync-type", type=click.Choice(["repo", "git"]), default=None,
               help="代码同步方式: repo (默认) | git")
 @click.pass_context
-def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type):
+def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_size_gb, sync_type):
     """配置 base project 并创建 base LV（格式化 + 填充内容）。"""
     config_path = ctx.obj["config_path"]
 
@@ -518,7 +551,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
     mode = g["mode"]
 
     # Check if all add-specific options are provided
-    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, base_lv_size_gb, sync_type])
+    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, username, base_lv_size_gb, sync_type])
 
     if all_provided:
         bp_name = name
@@ -541,6 +574,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
             "repo_branch": repo_branch or "main",
             "sync_type": sync_type or "repo",
             "docker_image": docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest"),
+            "username": username or _default_username(),
             "base_lv_size_gb": base_lv_size_gb or (1 if mode == "mock" else 100),
             "build_config": {
                 "setup_commands": ["source build/envsetup.sh", "lunch aosp_x86_64-eng"],
@@ -559,6 +593,8 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
             bp["sync_type"] = sync_type
         if docker_image is not None:
             bp["docker_image"] = docker_image
+        if username is not None:
+            bp["username"] = username
         if base_lv_size_gb is not None:
             bp["base_lv_size_gb"] = base_lv_size_gb
 
@@ -568,6 +604,8 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
         bp.setdefault("sync_type", "repo")
         bp["sync_type"] = click.prompt("同步方式 (repo/git)", default=bp["sync_type"])
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
+        bp.setdefault("username", _default_username())
+        bp["username"] = click.prompt("容器 USERNAME", default=bp["username"])
         bp["base_lv_size_gb"] = click.prompt("基底卷大小 (GB)", type=int, default=bp["base_lv_size_gb"])
 
     # Ask if this should be the default base project
@@ -608,6 +646,8 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, base_lv_size_gb, syn
     click.echo(f"Base project '{bp_name}' linked and initialized.")
     click.echo(f"  base_lv_name    = {_base_lv_name(bp_name)} (自动生成)")
     click.echo(f"  base_mount_path = {_base_mount_path(config, bp_name)} (自动生成)")
+    if bp.get("username"):
+        click.echo(f"  username        = {bp['username']}")
     if is_default:
         click.echo(f"  default_base    = {bp_name}")
 
@@ -740,7 +780,7 @@ def activate(ctx, workspace_name, base):
         # Activate base LV: mount + start default container
         ctx.invoke(mount_cmd, workspace_name=None, base=base)
         mount_path = _base_mount_path(config, project_name)
-        _start_container(container_name(project_name, "default"), mount_path, project_name, docker_image)
+        _start_container(bp, container_name(project_name, "default"), mount_path, project_name, docker_image)
         click.echo(f"Base LV '{base}' activated.")
         return
 
@@ -758,7 +798,7 @@ def activate(ctx, workspace_name, base):
 
     # Start container
     mount_path = _workspace_mount_path(config, project_name, workspace_name)
-    _start_container(container_name(project_name, workspace_name), mount_path, project_name, docker_image)
+    _start_container(bp, container_name(project_name, workspace_name), mount_path, project_name, docker_image)
 
     click.echo(f"Workspace '{workspace_name}' activated.")
 

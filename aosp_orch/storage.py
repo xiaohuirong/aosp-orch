@@ -1,5 +1,6 @@
 """Storage layer: LVM, loop device, mount, and Docker operations."""
 
+import getpass
 import subprocess
 import os
 import logging
@@ -220,15 +221,34 @@ def docker_image_exists(image_name: str) -> bool:
     return result.returncode == 0
 
 
-def docker_run(name: str, mount_path: str, volume_dest: str, image: str, uid: int | None = None, gid: int | None = None) -> None:
-    """Run a detached container."""
-    cmd = ["docker", "run", "-d", "--name", name]
+def docker_run(
+    name: str,
+    mount_path: str,
+    volume_dest: str,
+    image: str,
+    uid: int | None = None,
+    gid: int | None = None,
+    username: str | None = None,
+) -> None:
+    """Run a detached container with the default AOSP build settings.
+
+    Keep the image's default ENTRYPOINT so custom bootstrap scripts inside the
+    image (for example entrypoint.sh) can run normally.
+    """
+    if uid is None:
+        uid = os.getuid()
+    if gid is None:
+        gid = os.getgid()
+    if username is None:
+        username = os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
+
+    cmd = ["docker", "run", "-itd", "--privileged=true", "--net", "host", "--name", name]
     cmd.extend(["-v", f"{mount_path}:{volume_dest}"])
-    if uid is not None and gid is not None:
-        cmd.extend(["-u", f"{uid}:{gid}"])
-    cmd.extend(["--entrypoint", "/bin/sh"])
+    cmd.extend(["-e", f"UID={uid}"])
+    cmd.extend(["-e", f"GID={gid}"])
+    cmd.extend(["-e", f"USERNAME={username}"])
     cmd.append(image)
-    cmd.extend(["-c", "tail -f /dev/null"])
+    cmd.extend(["sleep", "infinity"])
     _run(cmd)
     logger.info("Container '%s' started", name)
 

@@ -43,6 +43,7 @@ base_projects:
     repo_url: https://github.com/mock/manifest.git
     repo_branch: main
     docker_image: aosp-builder:mock
+    username: byted
     base_lv_size_gb: 1
     build_config:
       setup_commands:
@@ -73,6 +74,8 @@ base_projects:
 | workspace mount | `{workdir}/{project}/{workspace}` | `/tmp/aosp_workspaces/xxx/a` |
 
 **workspace 状态不存配置**：active/inactive 由 `docker_container_exists` 实时判断，配置文件中 workspace 只有 `name` 字段。
+
+**base_project 级 Docker 用户配置**：`USERNAME` 不放在 `global`，而是放在 `base_projects[].username`。原因是不同 base project 往往对应不同镜像/容器初始化脚本，所需用户名可能不同。容器启动时优先读取该字段，并通过 `-e USERNAME=...` 注入容器；未配置时回退到当前宿主用户。
 
 ---
 
@@ -330,7 +333,16 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 ### Docker 容器持久化
 
-容器使用 `--entrypoint /bin/sh -c "tail -f /dev/null"` 保持后台运行，而非依赖镜像默认 CMD。`docker_exec` 使用 `/bin/sh`（非 `/bin/bash`）以兼容 Alpine 镜像。
+容器启动时会注入 `UID`、`GID`、`USERNAME` 三个环境变量，便于镜像内的 `entrypoint.sh` 根据宿主用户信息创建用户、修复 home 目录权限、配置 sudo/gosu 等。
+
+**重要：不要覆盖镜像自带 ENTRYPOINT。**
+
+- 旧方案使用 `--entrypoint /bin/sh -c "tail -f /dev/null"` 保持后台运行
+- 新方案保留镜像默认 `ENTRYPOINT`，只传入一个长驻命令参数（当前实现为 `sleep infinity`）
+- 这样如果镜像内部有自定义初始化脚本（例如 `entrypoint.sh`），就能正常执行
+- 对于自身已经在“无参数”场景下默认执行 `sleep infinity` 的镜像，显式传参不是必须；当前代码保留显式传参是为了让容器常驻行为更稳定、明确
+
+`docker_exec` 仍使用 `/bin/sh`（非 `/bin/bash`）以兼容 Alpine 镜像。
 
 ### Git 同步模式
 
@@ -417,7 +429,23 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 
 ### 容器启动失败（Alpine 兼容性）
 
-`alpine/git` 镜像无 `/bin/bash`，`docker_exec` 改用 `/bin/sh`。容器持久化改用 `--entrypoint /bin/sh -c "tail -f /dev/null"`。
+`alpine/git` 镜像无 `/bin/bash`，因此 `docker_exec` 改用 `/bin/sh`。但容器启动阶段不能再强行写死 `--entrypoint /bin/sh`，否则会覆盖镜像自己的 `ENTRYPOINT`，导致镜像内 `entrypoint.sh` 无法执行。当前方案为：
+
+- 保留镜像默认 `ENTRYPOINT`
+- 通过环境变量注入 `UID/GID/USERNAME`
+- 传入 `sleep infinity` 作为长驻命令，保证容器初始化后不立刻退出
+
+该设计适用于需要在容器启动时动态创建用户、配置 sudo、修复 home 目录权限的构建镜像。
+
+### USERNAME 配置层级
+
+最初尝试将 `USERNAME` 放到 `global` 配置，但这会把不同 base project 的镜像初始化需求混在一起。最终改为放在 `base_projects[].username`：
+
+- 同一个 orchestrator 可以管理多个 base project
+- 不同项目可能使用不同 Docker 镜像
+- 不同镜像的 entrypoint 可能依赖不同用户名
+
+因此 `USERNAME` 应与具体 base project 绑定，而不是定义为全局字段。
 
 ### git clone 到已存在目录
 
