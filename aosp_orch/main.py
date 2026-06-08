@@ -1031,32 +1031,6 @@ def del_cmd(ctx, workspace_name, base):
     click.echo(f"Workspace '{workspace_name}' removed.")
 
 
-@cli.command()
-@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
-@click.pass_context
-def sync(ctx, base):
-    """基底强制更新（清盘流）：销毁所有工作区快照 + 重新填充 base LV。"""
-    config, bp, base = _resolve_bp(ctx, base)
-    _require_storage_runtime(config)
-
-    base_lv_name = _base_lv_name(bp["name"])
-
-    # 1. Stop shared container and destroy all workspace snapshots (keep config entries)
-    c_name = _default_container_name_for_bp(bp)
-    if docker_container_running(c_name):
-        docker_stop(c_name)
-    _destroy_all_workspaces(config, bp)
-
-    # 2. Check base LV exists
-    if not lv_exists(VG_NAME, base_lv_name):
-        click.echo(f"Base LV '{bp['name']}' 不存在，请先运行 'add --name {bp['name']}'。", err=True)
-        sys.exit(1)
-
-    # 3. Force re-populate base LV
-    _populate_base(config, bp, force=True)
-
-    click.echo(f"Base project '{bp['name']}' synced successfully.")
-
 
 @cli.command("remove")
 @click.argument("base_name", required=False)
@@ -1177,13 +1151,6 @@ def rebase(ctx, workspace_name, base):
 
     click.echo(f"Base project '{bp['name']}' rebase 完成。下次 new 可重建快照。")
 
-
-@cli.command()
-@click.option("--base", default=None, help="Base project name (默认使用 global.default_base)")
-@click.pass_context
-def compile_cmd(ctx, base):
-    """Alias for sync - re-compile the base."""
-    ctx.invoke(sync, base=base)
 
 
 @cli.command()

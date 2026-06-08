@@ -263,22 +263,6 @@ aosp-orch stop --base <project_name>
 aosp-orch del <workspace_name> --base <project_name>
 ```
 
-### `sync` —— 基底强制更新（清盘流）
-
-停止产品容器，销毁所有子工作区的快照卷，重新拉取/编译基底。**保留配置文件中的 workspace 条目**，下次需先 `new`/`mount` 再 `start`。支持 repo/git 两种同步方式。
-
-前提：base LV 已通过 `add` 创建。
-
-```bash
-aosp-orch sync --base <project_name>
-```
-
-### `compile` —— 别名，等同 `sync`
-
-```bash
-aosp-orch compile --base <project_name>
-```
-
 ### `rebase` —— 删除 workspace 快照（保留配置和 base LV）
 
 销毁指定 workspace 的快照卷和容器，**保留配置条目和 base LV**。下次 `new` 可重建快照。
@@ -315,11 +299,9 @@ aosp-orch destroy
 - **`mount`** → 激活 LV + 挂载 + 修复权限（前提：LV 已存在）
 - **`start`** = 启动/复用产品共享容器
 - **`stop`** = 停止产品共享容器
-- **`sync`** = `_destroy_all_workspaces` + 重新填充 base LV
 - **`rebase`** = 删除指定/所有 workspace 快照（保留配置，需确认）
 - **`remove`** = 删除 base project（位置参数，需确认）
 - **`default`** = 设置/清空 default_base
-- **`compile`** → `sync` 的别名
 
 使用 `.aosp_base_initialized` 标记文件判断 base LV 是否已首次填充。
 
@@ -330,12 +312,11 @@ start  = docker_start(shared_container)
 stop    = docker_stop(shared_container)
 del       = stop(shared_container if needed) + lvremove + 删配置
 rebase    = _destroy_workspace（保留配置，需确认）
-sync      = _destroy_all_workspaces + _populate_base(force=True)
 remove    = _destroy_all_workspaces + lvremove(base) + 删配置
 destroy   = _destroy_lvm_infrastructure + 删 pool image + 删 workdir + 删配置
 ```
 
-`_destroy_workspace` 是内部函数，执行卸载 + 删快照（不删配置）。共享容器的 stop/rm 由上层命令按需处理。`_destroy_all_workspaces` 遍历所有 workspace 调用 `_destroy_workspace`，被 `sync`、`rebase`（不指定 workspace 时）和 `remove` 复用。
+`_destroy_workspace` 是内部函数，执行卸载 + 删快照（不删配置）。共享容器的 stop/rm 由上层命令按需处理。`_destroy_all_workspaces` 遍历所有 workspace 调用 `_destroy_workspace`，被 `rebase`（不指定 workspace 时）和 `remove` 复用。
 
 ---
 
@@ -828,14 +809,6 @@ INFO: Container 'aosp_n1_default' started
 #### `_destroy_workspace(config, base, ws_name)`
 
 提取单个 workspace 的停容器+卸载+删快照逻辑。`_destroy_all_workspaces` 内部循环调用它，`rebase` 单 workspace 分支也直接调用，消除了重复的 docker_rm/umount/remove_lv 逻辑。
-
-### `sync` 复用 `_populate_base`
-
-`sync` 命令中 ~40 行的 mock/prod 分支填充逻辑与 `_populate_base` 几乎完全重复。给 `_populate_base` 加了 `force=True` 参数（先删 marker 再填充），`sync` 直接调用 `_populate_base(config, bp, force=True)` 即可。同时 `_populate_base` 增加了幂等性：挂载前检查 `is_lv_mounted`，卸载前检查 `is_lv_mounted`。
-
-### `compile` 命令简化
-
-`compile` 命令不再冗余地加载配置和解析 base（`sync` 自己会做），直接 `ctx.invoke(sync, base=base)`。函数名改为 `compile_cmd`（避免与内置函数冲突）。
 
 ### `remove_cmd` 复用 `_resolve_base`
 

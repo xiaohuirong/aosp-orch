@@ -441,60 +441,6 @@ class TestAssertion3DeactivationIdempotency:
         assert container_id_before == container_id_after, "container should be reused instead of recreated"
 
 
-class TestAssertion4ForceSync:
-    """断言 4: 强力清盘流验证"""
-
-    def test_sync_destroys_workspaces_and_refreshes_base(self, mock_config_path):
-        """sync --base must destroy all workspace snapshots and refresh base."""
-        _link_xxx(mock_config_path)
-        # Setup: create + activate a and b
-        run_cli(mock_config_path, "new", "a", "--base", "xxx")
-        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
-        result = run_cli(mock_config_path, "start", "a", "--base", "xxx")
-        assert result.returncode == 0, f"activate a failed: {result.stderr}"
-
-        run_cli(mock_config_path, "new", "b", "--base", "xxx")
-        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
-        result = run_cli(mock_config_path, "start", "b", "--base", "xxx")
-        assert result.returncode == 0, f"activate b failed: {result.stderr}"
-
-        # Write something in b to make it dirty
-        from aosp_orch.storage import docker_exec
-        docker_exec("aosp_xxx", "echo 'dirty data' > /xxx/b/dirty.txt")
-
-        # Run sync
-        result = run_cli(mock_config_path, "sync", "--base", "xxx")
-        assert result.returncode == 0, f"sync failed: {result.stderr}"
-
-        # Assert: snapshot LVs must be destroyed
-        assert not lv_exists(VG_NAME, _snapshot_lv_name("b")), \
-            "s-b still exists after sync"
-        assert not lv_exists(VG_NAME, _snapshot_lv_name("a")), \
-            "s-a still exists after sync"
-
-        # Assert: workspaces kept in config
-        config = read_config(mock_config_path)
-        bp = config["base_projects"][0]
-        ws_names = [w["name"] for w in bp.get("workspaces", [])]
-        assert "a" in ws_names and "b" in ws_names, \
-            "Workspaces should still exist in config after sync"
-
-        # Re-create b (snapshot was destroyed by sync, config entry kept) then activate
-        run_cli(mock_config_path, "new", "b", "--base", "xxx")
-        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
-        result = run_cli(mock_config_path, "start", "b", "--base", "xxx")
-        assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
-
-        # Assert: s-b is recreated
-        assert lv_exists(VG_NAME, _snapshot_lv_name("b")), \
-            "s-b not recreated on create+activate after sync"
-
-        # Assert: b is in clean state (no dirty.txt from before)
-        result = docker_exec("aosp_xxx", "ls /xxx/b/dirty.txt 2>&1; echo EXIT_CODE=$?")
-        assert "dirty.txt" not in result.stdout or "No such file" in result.stdout, \
-            f"Workspace b is not clean after sync+activate! Output: {result.stdout}"
-
-
 class TestSnapshotSpaceSaving:
     """验证快照节省空间的机制是否生效。"""
 
