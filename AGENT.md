@@ -432,6 +432,38 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 `docker_exec` 仍使用 `/bin/sh`（非 `/bin/bash`）以兼容 Alpine 镜像。
 
+### 父目录共享挂载与子挂载传播
+
+当前产品共享容器并不是分别把 `base`、各个 workspace 单独 bind 进容器，而是把**宿主机产品根目录**整体映射到容器内：
+
+- 宿主机：`{workdir}/{project}`
+- 容器内：`/{project}`
+
+然后依赖 Linux mount propagation，让后续出现在该目录树下的子挂载（例如 `/{project}/base`、`/{project}/{workspace}`）自动在容器内可见。
+
+这个设计有一个很重要的细节：**如果父目录在变成 shared mount 之前，其下已经存在子挂载，那么父目录的自绑定必须使用递归 bind（`mount --rbind path path`），不能只用普通 bind（`mount --bind path path`）。**
+
+典型问题场景如下：
+
+- `/home/bytedance/aosp-workspace/n1` 只是宿主机根盘上的普通目录
+- `/home/bytedance/aosp-workspace/n1/base` 是后续单独挂上的 LV
+- 若此时再对 `/home/bytedance/aosp-workspace/n1` 做普通 `--bind` + `--make-rshared`
+- 则这个 bind 树可能**不会把已经存在的 `base` 子挂载一起纳入传播树**
+- 结果就是：容器虽然看到了 `/{project}`，但看不到或看不正确 `/{project}/base`
+
+因此当前实现约束为：
+
+1. `ensure_shared_mount(path)` 必须在需要时使用 `mount --rbind path path`
+2. 然后再执行 `mount --make-rshared path`
+3. `mount` 命令在真正挂 base LV / workspace 快照之前，要先确保 product root 已被处理为 shared mount
+
+可以把这个规则理解为：
+
+- **容器看到的不是“某个单独的 base bind mount”**
+- **而是“产品根目录这个 bind 树里传播进来的子挂载”**
+
+所以任何关于 `enter` / `mount` / `activate` 的实现调整，只要涉及容器可见性，都必须优先检查“父目录 bind 树是否正确承载了已有子挂载”。
+
 ### Git 同步模式
 
 `sync_type: git` 时，代码同步到容器内 `/{project_name}/base/git-repo` 子目录：
@@ -505,6 +537,23 @@ uv run pytest test_orchestrator.py -v
   - 验证：当 `pool.img` 和 `vg0` 都不存在时，报错应明确指向“LVM 基础设施不存在，请先运行 init”，而不是把问题归咎为某个 base LV 缺失
 
 这两条测试的目的不是替代真实 E2E，而是把“错误分类”和“恢复路径”稳定下来，避免未来重构时再次回归到错误提示不准确的问题。
+
+### 针对 mount propagation 的补充测试
+
+除 loop/VG 恢复类回归外，后续还补了两条**偏挂载传播语义**的回归测试（同样通过 `CliRunner + monkeypatch` / 逻辑层 mock 实现），专门覆盖“父目录整体映射到容器内时，已有子挂载是否能被正确传播”的问题：
+
+- `test_ensure_shared_mount_uses_rbind_for_existing_submounts`
+  - 验证：`ensure_shared_mount()` 在需要自绑定时使用的是 `mount --rbind path path`，而不是普通 `--bind`
+  - 目的：确保父目录进入 shared bind 树前，已有子挂载也被一起纳入传播范围
+- `test_mount_ensures_shared_product_root_before_mounting_lv`
+  - 验证：`mount` 命令会先准备 product root 的 shared mount，再去挂 base LV / workspace LV
+  - 目的：避免出现“先把子挂载挂上去，后面容器再绑定父目录时丢失子挂载传播关系”的顺序问题
+
+这两条测试不是在验证 LVM 本身是否可用，而是在锁定一个更容易被重构破坏的约束：
+
+- **容器路径可见性 = 父目录 bind 树 + shared propagation 是否正确**
+
+而不只是“底层 LV 是否已经 mount 成功”。
 
 ### 测试环境 Mock
 
@@ -690,6 +739,36 @@ Base LV 'n1' 不存在，请先运行 'add --name n1'。
 ### enter 自动激活
 
 `enter` 命令在容器未激活时不再直接报错退出，而是询问用户"是否立即激活?"（默认 Y）。确认后自动调用 `activate` 激活，再进入容器 Shell。进入后会自动切到 `/{project}/base` 或 `/{project}/{workspace}`。
+
+### enter 后容器内看不到 base/workspace 挂载的问题
+
+曾出现过如下现象：
+
+```bash
+python3 -m aosp_orch enter
+INFO: Mounted /dev/vg0/n1 -> /home/bytedance/aosp-workspace/n1/base
+INFO: Ensured shared mount propagation on /home/bytedance/aosp-workspace/n1
+INFO: Container 'aosp_n1_default' started
+```
+
+但进入容器后，`/n1/base` 的内容并不符合宿主机上真实的 LV 挂载状态。
+
+这个问题的关键不是 Docker 容器有没有启动成功，也不是 base LV 有没有 mount 成功，而是：
+
+- 容器映射的是宿主机 `/{workdir}/{project}` 整个父目录
+- `base` 是这个父目录下的一个**后续子挂载**
+- 如果父目录变成 shared mount 的方式不对（例如只做普通 `--bind`），那么已经存在的 `base` 子挂载可能不会进入传播树
+
+修正后的规则是：
+
+- `ensure_shared_mount()` 必须使用递归 bind（`--rbind`）承载已有子挂载
+- `mount_cmd()` 在挂 LV 前先确保 product root 已是 shared mount
+- 这样无论 `enter` 是触发 base mount、workspace mount，还是只是进入一个已存在的共享容器，容器都能通过父目录传播正确看到 `/{project}/base` 与 `/{project}/{workspace}`
+
+可以把这类问题统一归因成：
+
+- **不是“某个路径没 mount”**
+- 而是“父目录的 bind tree / propagation 关系不对，导致容器内看不到正确的子挂载视图”
 
 ### rebase 命令
 
