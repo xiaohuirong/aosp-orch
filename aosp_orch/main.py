@@ -423,15 +423,7 @@ def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
             docker_build_mock(docker_image)
         mock_populate_base(base_mount_path)
     else:
-        build_config = bp.get("build_config", {})
         c_name = _start_container(config, bp)
-        for cmd in build_config.get("setup_commands", []):
-            docker_exec(c_name, f"cd /{project_name}/base && {cmd}")
-        compile_cmd = build_config.get("compile_command", "")
-        env_vars = build_config.get("env_vars", {})
-        env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
-        if compile_cmd:
-            docker_exec(c_name, f"cd /{project_name}/base && {env_str} {compile_cmd}")
         docker_stop(c_name)
 
     # Write marker
@@ -602,13 +594,11 @@ def init(ctx, mode, workdir, pool_image_size_gb):
 
 @cli.command("add")
 @click.option("--name", default=None, help="Base project 名称")
-@click.option("--repo-url", default=None, help="远程清单仓库地址")
-@click.option("--repo-branch", default=None, help="清单仓库分支")
 @click.option("--docker-image", default=None, help="Docker 镜像名称")
 @click.option("--username", default=None, help="该 base project 对应容器注入的 USERNAME 环境变量")
 @click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
 @click.pass_context
-def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_size_gb):
+def add_cmd(ctx, name, docker_image, username, base_lv_size_gb):
     """配置 base project 并创建 base LV（格式化 + 填充内容）。"""
     config_path = ctx.obj["config_path"]
 
@@ -629,7 +619,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
     mode = g["mode"]
 
     # Check if all add-specific options are provided
-    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, username, base_lv_size_gb])
+    all_provided = all(v is not None for v in [name, docker_image, username, base_lv_size_gb])
 
     if all_provided:
         bp_name = name
@@ -648,24 +638,12 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
     if bp is None:
         bp = {
             "name": bp_name,
-            "repo_url": repo_url or "https://android.googlesource.com/platform/manifest",
-            "repo_branch": repo_branch or "main",
             "docker_image": docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest"),
             "username": username or _default_username(),
             "base_lv_size_gb": base_lv_size_gb or (1 if mode == "mock" else 100),
-            "build_config": {
-                "setup_commands": ["source build/envsetup.sh", "lunch aosp_x86_64-eng"],
-                "compile_command": "m -j$(nproc)",
-                "env_vars": {"USE_CCACHE": "1"},
-            },
-            "workspaces": [],
         }
         config.setdefault("base_projects", []).append(bp)
     else:
-        if repo_url is not None:
-            bp["repo_url"] = repo_url
-        if repo_branch is not None:
-            bp["repo_branch"] = repo_branch
         if docker_image is not None:
             bp["docker_image"] = docker_image
         if username is not None:
@@ -674,8 +652,6 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
             bp["base_lv_size_gb"] = base_lv_size_gb
 
     if not all_provided:
-        bp["repo_url"] = click.prompt("清单仓库地址", default=bp["repo_url"])
-        bp["repo_branch"] = click.prompt("清单分支", default=bp["repo_branch"])
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
         bp.setdefault("username", _default_username())
         bp["username"] = click.prompt("容器 USERNAME", default=bp["username"])
