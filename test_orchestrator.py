@@ -263,6 +263,7 @@ def _link_xxx(config_path: str):
         "--repo-url", "https://github.com/mock/manifest.git",
         "--repo-branch", "main",
         "--docker-image", "aosp-builder:mock",
+        "--username", "user",
         "--base-lv-size-gb", "1",
         "--sync-type", "repo",
     )
@@ -279,6 +280,7 @@ class TestAssertion1Initialization:
             "--repo-url", "https://github.com/mock/manifest.git",
             "--repo-branch", "main",
             "--docker-image", "aosp-builder:mock",
+            "--username", "user",
             "--base-lv-size-gb", "1",
             "--sync-type", "repo",
         )
@@ -312,6 +314,7 @@ class TestAssertion1Initialization:
             "--repo-url", "https://github.com/mock/manifest.git",
             "--repo-branch", "main",
             "--docker-image", "aosp-builder:mock",
+            "--username", "user",
             "--base-lv-size-gb", "1",
             "--sync-type", "repo",
         )
@@ -514,6 +517,7 @@ class TestGitSync:
             "--repo-url", "https://github.com/xiaohuirong/txt2sub",
             "--repo-branch", "main",
             "--docker-image", "alpine/git",
+            "--username", "user",
             "--base-lv-size-gb", "1",
             "--sync-type", "git",
         )

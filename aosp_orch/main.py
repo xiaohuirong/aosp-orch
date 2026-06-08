@@ -1,6 +1,5 @@
 """AOSP Block Device Build Container Orchestrator - CLI Entry Point."""
 
-import getpass
 import sys
 import os
 import logging
@@ -147,8 +146,8 @@ def _resolve_base(config: dict, base: str | None) -> str:
 
 
 def _default_username() -> str:
-    """Resolve default container username from env/current user."""
-    return os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
+    """Resolve default container username."""
+    return "user"
 
 
 def _container_username(bp: dict) -> str:

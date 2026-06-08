@@ -1,6 +1,5 @@
 """Storage layer: LVM, loop device, mount, and Docker operations."""
 
-import getpass
 import subprocess
 import os
 import logging
@@ -240,7 +239,7 @@ def docker_run(
     if gid is None:
         gid = os.getgid()
     if username is None:
-        username = os.environ.get("USERNAME") or os.environ.get("USER") or getpass.getuser()
+        username = "user"
 
     cmd = ["docker", "run", "-itd", "--privileged=true", "--net", "host", "--name", name]
     cmd.extend(["-v", f"{mount_path}:{volume_dest}"])
