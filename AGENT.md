@@ -43,7 +43,7 @@ base_projects:
     repo_url: https://github.com/mock/manifest.git
     repo_branch: main
     docker_image: aosp-builder:mock
-    username: byted
+    username: user
     base_lv_size_gb: 1
     build_config:
       setup_commands:
@@ -75,7 +75,7 @@ base_projects:
 
 **workspace 状态不存配置**：active/inactive 由 `docker_container_exists` 实时判断，配置文件中 workspace 只有 `name` 字段。
 
-**base_project 级 Docker 用户配置**：`USERNAME` 不放在 `global`，而是放在 `base_projects[].username`。原因是不同 base project 往往对应不同镜像/容器初始化脚本，所需用户名可能不同。容器启动时优先读取该字段，并通过 `-e USERNAME=...` 注入容器；未配置时回退到当前宿主用户。
+**base_project 级 Docker 用户配置**：`USERNAME` 不放在 `global`，而是放在 `base_projects[].username`。原因是不同 base project 往往对应不同镜像/容器初始化脚本，所需用户名可能不同。容器启动时优先读取该字段，并通过 `-e USERNAME=...` 注入容器；未配置时当前默认值固定为 `user`（不再跟随宿主机 `USER/USERNAME`）。
 
 ---
 
@@ -335,6 +335,8 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 容器启动时会注入 `UID`、`GID`、`USERNAME` 三个环境变量，便于镜像内的 `entrypoint.sh` 根据宿主用户信息创建用户、修复 home 目录权限、配置 sudo/gosu 等。
 
+当前实现中，`USERNAME` 的默认值固定为 `user`。这样测试、CLI 非交互调用以及不同宿主机环境下的行为更稳定，不会因为本机用户名不同而导致容器内初始化行为漂移。
+
 **重要：不要覆盖镜像自带 ENTRYPOINT。**
 
 - 旧方案使用 `--entrypoint /bin/sh -c "tail -f /dev/null"` 保持后台运行
@@ -383,6 +385,8 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 
 测试使用 **pytest `tmp_path` fixture** 为每个测试创建独立的临时配置文件，不同测试使用不同的 workdir（`/tmp/aosp_test_mock` 和 `/tmp/aosp_test_prod`），实现完全隔离。
 
+由于 `add` 命令现在支持 `base_projects[].username`，测试中凡是走非交互 `add --name ...` 路径的地方，都应显式传入 `--username user`，否则会被识别为交互模式并等待用户输入。
+
 - Mock 测试：workdir = `/tmp/aosp_test_mock`，项目名 `xxx`，Docker 镜像 `aosp-builder:mock`
 - Prod/Git 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`，sync_type = git
 
@@ -408,6 +412,24 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 - Base LV 大小：1GB
 - Mock 工作目录：`/tmp/aosp_test_mock/`
 - Prod 工作目录：`/tmp/aosp_test_prod/`
+
+### 测试执行前提
+
+当前这组 `test_orchestrator.py` 属于真实 E2E 测试，不是纯 mock 单测。它们会实际调用：
+
+- `sudo fallocate`
+- `losetup`
+- `pvcreate/vgcreate/lvcreate/lvremove`
+- `mount/umount`
+- `docker`
+
+因此在 CI 或本地运行时，需要满足以下前提：
+
+1. 当前用户具备这些命令的执行权限
+2. `sudo` 必须可非交互执行（通常要求免密 sudo）
+3. Docker / LVM / loop device / dmsetup 相关能力可用
+
+若环境中 `sudo` 需要密码，则测试会在创建 pool image 的第一步失败，例如：`sudo fallocate -l 2G /tmp/aosp_test_mock/pool.img`。
 
 ### 测试清理
 
@@ -446,6 +468,8 @@ python3 -m pytest test_orchestrator.py -v    # 必须输出 10 passed
 - 不同镜像的 entrypoint 可能依赖不同用户名
 
 因此 `USERNAME` 应与具体 base project 绑定，而不是定义为全局字段。
+
+另外，默认用户名最终固定为 `user`，而不是从宿主环境动态推导。这一策略是为了降低跨机器差异，尤其是避免测试在不同用户名的开发机上表现不一致。
 
 ### git clone 到已存在目录
 
