@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import pytest
+from click.testing import CliRunner
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -33,6 +34,7 @@ from aosp_orch.storage import (
     docker_rm,
 )
 from aosp_orch.main import (
+    cli,
     get_base_project,
     VG_NAME,
     THIN_POOL_NAME,
@@ -605,3 +607,108 @@ class TestGitSync:
         c_name = "aosp_aosp"
         check = docker_exec(c_name, "test -d /aosp/base/git-repo/.git && echo EXISTS || echo MISSING")
         assert "EXISTS" in check.stdout, f"git-repo/.git not found after re-activate. Output: {check.stdout}"
+
+
+class TestLoopRecovery:
+    """验证 loop/VG 丢失时的恢复与错误提示行为。"""
+
+    def test_enter_recovers_storage_runtime_from_existing_pool_image(self, tmp_path, monkeypatch):
+        """When pool image exists but loop/VG is gone, enter should recover runtime infra instead of misreporting missing base LV."""
+        config_path = str(tmp_path / "config.yaml")
+        workdir = str(tmp_path / "workdir")
+        config = {
+            "global": {
+                "mode": "mock",
+                "workdir": workdir,
+                "pool_image_size_gb": 2,
+                "default_base": "n1",
+            },
+            "base_projects": [
+                {
+                    "name": "n1",
+                    "repo_url": "https://github.com/mock/manifest.git",
+                    "repo_branch": "main",
+                    "docker_image": "aosp-builder:mock",
+                    "base_lv_size_gb": 1,
+                    "workspaces": [],
+                },
+            ],
+        }
+        write_config(config_path, config)
+        os.makedirs(workdir, exist_ok=True)
+        open(os.path.join(workdir, "pool.img"), "a").close()
+
+        import aosp_orch.main as main_mod
+
+        runner = CliRunner()
+        state = {"vg_exists_calls": 0, "setup_loop_called": False, "mount_called": False}
+
+        def fake_vg_exists(_vg_name):
+            state["vg_exists_calls"] += 1
+            return state["vg_exists_calls"] >= 2
+
+        def fake_setup_loop_device(_image_path):
+            state["setup_loop_called"] = True
+            return "/dev/loop9"
+
+        def fake_mount(_device, _mount_path):
+            state["mount_called"] = True
+
+        def fake_execvp(_file, _args):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(main_mod, "vg_exists", fake_vg_exists)
+        monkeypatch.setattr(main_mod, "get_loop_device_for_image", lambda _path: None)
+        monkeypatch.setattr(main_mod, "setup_loop_device", fake_setup_loop_device)
+        monkeypatch.setattr(main_mod, "_sudo_run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""))
+        monkeypatch.setattr(main_mod, "lv_exists", lambda _vg, _lv: True)
+        monkeypatch.setattr(main_mod, "is_mounted", lambda _path: False)
+        monkeypatch.setattr(main_mod, "is_lv_mounted", lambda _vg, _lv: False)
+        monkeypatch.setattr(main_mod, "activate_lv", lambda _vg, _lv: None)
+        monkeypatch.setattr(main_mod, "mount", fake_mount)
+        monkeypatch.setattr(main_mod, "docker_container_running", lambda _name: True)
+        monkeypatch.setattr(main_mod.os, "execvp", fake_execvp)
+
+        result = runner.invoke(cli, ["--config", config_path, "enter", "--base", "n1"])
+
+        assert result.exit_code == 0, result.output
+        assert state["setup_loop_called"], "应该在已有 pool image 时重建 loop 设备"
+        assert state["mount_called"], "恢复存储运行态后应继续挂载 base LV"
+        assert "Base LV 'n1' 不存在" not in result.output, result.output
+
+    def test_mount_reports_missing_lvm_infrastructure_instead_of_missing_base_lv(self, tmp_path, monkeypatch):
+        """When neither VG nor pool image exists, commands should guide user to init instead of claiming base LV is missing."""
+        config_path = str(tmp_path / "config.yaml")
+        workdir = str(tmp_path / "workdir")
+        config = {
+            "global": {
+                "mode": "mock",
+                "workdir": workdir,
+                "pool_image_size_gb": 2,
+                "default_base": "n1",
+            },
+            "base_projects": [
+                {
+                    "name": "n1",
+                    "repo_url": "https://github.com/mock/manifest.git",
+                    "repo_branch": "main",
+                    "docker_image": "aosp-builder:mock",
+                    "base_lv_size_gb": 1,
+                    "workspaces": [],
+                },
+            ],
+        }
+        write_config(config_path, config)
+
+        import aosp_orch.main as main_mod
+
+        runner = CliRunner()
+        monkeypatch.setattr(main_mod, "vg_exists", lambda _vg_name: False)
+        monkeypatch.setattr(main_mod, "get_loop_device_for_image", lambda _path: None)
+
+        result = runner.invoke(cli, ["--config", config_path, "mount", "--base", "n1"])
+
+        assert result.exit_code != 0
+        assert "LVM 基础设施不存在" in result.output, result.output
+        assert "请先运行 'init'" in result.output, result.output
+        assert "Base LV 'n1' 不存在" not in result.output, result.output

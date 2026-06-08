@@ -307,18 +307,77 @@ def _is_base_active(bp: dict) -> bool:
 
 # ── LVM / Pool helpers ───────────────────────────────────────
 
+def _try_recover_pool_and_vg(config: dict) -> bool:
+    """Try to recover an existing VG from the persisted pool image.
+
+    Typical scenario: after reboot the loop device disappears, but the pool image
+    still exists and contains valid LVM metadata. In that case we should reattach
+    the loop device and reactivate the VG instead of reinitializing the image.
+    """
+    pool_image_path = _pool_image_path(config)
+    if not os.path.exists(pool_image_path):
+        return False
+
+    loop_dev = get_loop_device_for_image(pool_image_path)
+    if not loop_dev:
+        loop_dev = setup_loop_device(pool_image_path)
+
+    _sudo_run(["pvscan", "--cache", loop_dev], check=False)
+    _sudo_run(["vgscan"], check=False)
+    _sudo_run(["vgchange", "-ay", VG_NAME], check=False)
+    return vg_exists(VG_NAME)
+
+
+def _storage_runtime_ready(config: dict) -> bool:
+    """Return whether runtime LVM infrastructure is available.
+
+    If the VG is currently missing but the pool image still exists, try to recover
+    it automatically.
+    """
+    if vg_exists(VG_NAME):
+        return True
+    return _try_recover_pool_and_vg(config)
+
+
+def _require_storage_runtime(config: dict) -> None:
+    """Ensure runtime storage infrastructure exists, otherwise exit with guidance."""
+    if _storage_runtime_ready(config):
+        return
+
+    pool_image_path = _pool_image_path(config)
+    if not os.path.exists(pool_image_path):
+        click.echo(
+            f"LVM 基础设施不存在：未找到 pool image '{pool_image_path}'。请先运行 'init'。",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"LVM 基础设施未就绪：检测到 pool image '{pool_image_path}'，但未能恢复卷组 '{VG_NAME}'。"
+            "请先检查 loop 设备/LVM 状态，或重新运行 'init'。",
+            err=True,
+        )
+    sys.exit(1)
+
 def _ensure_pool_and_vg(config: dict) -> None:
     """Create pool image, loop device, VG, and thin pool if they don't exist."""
     pool_image_path = _pool_image_path(config)
     pool_size_gb = config["global"]["pool_image_size_gb"]
 
-    if vg_exists(VG_NAME):
+    if _storage_runtime_ready(config):
         return
 
+    if os.path.exists(pool_image_path):
+        click.echo(
+            f"检测到已有 pool image '{pool_image_path}'，但无法恢复卷组 '{VG_NAME}'。"
+            "为避免破坏现有数据，不会自动重新初始化。请先检查 loop/LVM 状态，"
+            "或重新运行 'init' 并按提示选择是否覆盖。",
+            err=True,
+        )
+        sys.exit(1)
+
     # Create pool image
-    if not os.path.exists(pool_image_path):
-        os.makedirs(os.path.dirname(pool_image_path), exist_ok=True)
-        create_pool_image(pool_image_path, pool_size_gb)
+    os.makedirs(os.path.dirname(pool_image_path), exist_ok=True)
+    create_pool_image(pool_image_path, pool_size_gb)
 
     # Setup loop device
     loop_dev = get_loop_device_for_image(pool_image_path)
@@ -748,6 +807,7 @@ def new_cmd(ctx, workspace_name, base):
 def mount_cmd(ctx, workspace_name, base):
     """挂载工作区快照。不指定 workspace 时挂载 base LV。前提：LV 已存在。"""
     config, bp, base = _resolve_bp(ctx, base)
+    _require_storage_runtime(config)
 
     project_name = bp["name"]
 
@@ -976,6 +1036,7 @@ def del_cmd(ctx, workspace_name, base):
 def sync(ctx, base):
     """基底强制更新（清盘流）：销毁所有工作区快照 + 重新填充 base LV。"""
     config, bp, base = _resolve_bp(ctx, base)
+    _require_storage_runtime(config)
 
     base_lv_name = _base_lv_name(bp["name"])
 

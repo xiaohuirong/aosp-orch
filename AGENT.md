@@ -358,6 +358,49 @@ workspace 的 active/inactive 状态**不存储在配置文件中**，而是通�
 
 Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lvchange -K -ay` 才能激活，否则 mount 报 `Can't lookup blockdev` 错误。
 
+### loop 设备丢失后的恢复策略
+
+真实使用中，一个常见场景是：**配置文件还在、pool image 还在、base LV 实际数据也还在，但宿主机重启后 loop device / VG 运行态丢了**。这时如果 CLI 只看 `lv_exists(vg0/<base>)`，很容易误报：
+
+- `Base LV 'n1' 不存在，请先运行 'add --name n1'`
+
+但真实问题并不是“base LV 被删除”，而是：
+
+- `pool.img` 仍在磁盘上
+- loop device 没重新 attach
+- LVM metadata 没重新 scan/activate
+
+当前设计改为分两层判断：
+
+1. **持久化层**：`pool.img` 是否存在
+2. **运行态层**：`vg0` 是否已存在 / 可恢复
+
+恢复策略如下：
+
+- 若 `vg0` 已存在：直接继续
+- 若 `vg0` 不存在但 `pool.img` 存在：
+  - 重新 `losetup`
+  - 执行 `pvscan --cache`
+  - 执行 `vgscan`
+  - 执行 `vgchange -ay vg0`
+  - 若恢复成功，则继续后续 mount / enter / sync 流程
+- 若 `vg0` 不存在且 `pool.img` 也不存在：明确提示用户先执行 `init`
+
+**重要约束：不要在“已有 pool image 但 VG 恢复失败”时自动重建 thin-pool。**
+
+原因是这通常意味着磁盘上的旧数据还在，只是 loop/LVM 运行态异常；如果此时贸然 `pvcreate/vgcreate/lvcreate`，会破坏已有数据。当前策略是：
+
+- 自动尝试“恢复运行态”
+- 恢复失败则报错退出
+- 将“是否覆盖并重建”保留给 `init` 的显式确认流程
+
+因此可以把 `_ensure_pool_and_vg()` 的语义理解为：
+
+- **优先恢复已有持久化基础设施**
+- **只有在 pool image 本身不存在时，才执行首次初始化**
+
+对于 `mount` / `enter` / `sync` 这类依赖 LVM 运行态的命令，进入具体 `lv_exists(...)` 判断前应先做“storage runtime ready”检查，否则容易把“VG 未恢复”误诊成“Base LV 不存在”。
+
 ### Docker 容器持久化
 
 容器启动时会注入 `UID`、`GID`、`USERNAME` 三个环境变量，便于镜像内的 `entrypoint.sh` 根据宿主用户信息创建用户、修复 home 目录权限、配置 sudo/gosu 等。
@@ -451,6 +494,17 @@ uv run pytest test_orchestrator.py -v
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
 | Git | `test_git_clone_to_git_repo_dir` | git sync 模式下代码位于 /{project}/base/git-repo |
 | Git | `test_git_pull_on_reactivate` | 重新 activate 时复用共享容器且 base git-repo 仍保留 |
+
+### 针对 loop 恢复问题的补充测试
+
+除上面的真实 E2E 用例外，后续还增加了两条**偏 CLI 逻辑层**的回归测试（通过 `CliRunner + monkeypatch` 实现），专门覆盖“pool image 仍在但 loop/VG 运行态丢失”的问题：
+
+- `test_enter_recovers_storage_runtime_from_existing_pool_image`
+  - 验证：`enter --base <project>` 在检测到 `pool.img` 仍存在时，会先尝试恢复 loop/VG，再继续 mount / enter，而不是直接误报 “Base LV 不存在”
+- `test_mount_reports_missing_lvm_infrastructure_instead_of_missing_base_lv`
+  - 验证：当 `pool.img` 和 `vg0` 都不存在时，报错应明确指向“LVM 基础设施不存在，请先运行 init”，而不是把问题归咎为某个 base LV 缺失
+
+这两条测试的目的不是替代真实 E2E，而是把“错误分类”和“恢复路径”稳定下来，避免未来重构时再次回归到错误提示不准确的问题。
 
 ### 测试环境 Mock
 
@@ -601,6 +655,37 @@ pip install aosp-orch     # 从 PyPI（未来）
 `init` 创建 LVM 磁盘前会检查 pool image 是否已存在。若存在，询问用户是否覆盖（默认 N）。覆盖时先调用 `_destroy_lvm_infrastructure()` 销毁所有容器、卸载、删除所有 LV/VG/loop device，再删除 pool image 文件，最后重新创建。不覆盖则跳过磁盘创建，保留现有数据。
 
 `_destroy_lvm_infrastructure()` 是内部函数，遍历所有 base project 执行停容器 + 卸载 + 删 LV，然后删除 VG 和 loop device。被 `init` 覆盖流程复用。
+
+补充说明：这里的“已有 pool image”要区分两类情况：
+
+- **运行态丢失但数据仍在**：应优先尝试恢复 loop/VG
+- **用户明确要重建**：才走 `init` 的覆盖确认流程
+
+也就是说，“恢复已有数据”和“销毁后重建”是两条不同路径，不能混用。
+
+### loop 设备丢失时 enter/mount 的报错修正
+
+曾出现过如下误导性现象：
+
+```bash
+python3 -m aosp_orch enter
+Base LV 'n1' 不存在，请先运行 'add --name n1'。
+```
+
+但当时配置里的 base project 其实已经存在，真实问题是 loop device/VG 运行态在宿主机上消失了。
+
+修正后的规则：
+
+- **优先判断 LVM 基础设施是否存在/可恢复**
+- **只有在 LVM 运行态正常后，才判断 base LV 是否真的不存在**
+
+因此现在的错误语义变为：
+
+- `pool.img` 不存在 → 提示先 `init`
+- `pool.img` 存在且可恢复 → 自动恢复后继续执行
+- `pool.img` 存在但恢复失败 → 提示用户检查 loop/LVM 状态或重新 `init`
+
+这样用户看到的报错会更接近真实根因，也避免误导用户去重复执行 `add`，从而破坏对现有数据状态的判断。
 
 ### enter 自动激活
 
