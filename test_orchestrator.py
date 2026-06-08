@@ -718,8 +718,8 @@ class TestLoopRecovery:
 class TestMountPropagation:
     """验证挂载传播相关回归场景。"""
 
-    def test_ensure_shared_mount_uses_rbind_for_existing_submounts(self, monkeypatch):
-        """ensure_shared_mount should use recursive bind so existing submounts propagate into containers."""
+    def test_ensure_shared_mount_uses_bind_for_self_binding(self, monkeypatch):
+        """ensure_shared_mount should use bind to bind path to itself before setting shared propagation."""
         import aosp_orch.storage as storage_mod
 
         calls = []
@@ -735,8 +735,8 @@ class TestMountPropagation:
 
         storage_mod.ensure_shared_mount("/tmp/aosp-propagation-test")
 
-        assert ["mount", "--rbind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] in calls
-        assert ["mount", "--bind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] not in calls
+        assert ["mount", "--bind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] in calls
+        assert ["mount", "--rbind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] not in calls
 
     def test_mount_ensures_shared_product_root_before_mounting_lv(self, tmp_path, monkeypatch):
         """mount should prepare the product root as shared before mounting base/workspace LVs."""

@@ -202,11 +202,10 @@ def ensure_shared_mount(path: str) -> None:
     os.makedirs(path, exist_ok=True)
     result = _sudo_run(["mountpoint", "-q", path], check=False)
     if result.returncode != 0:
-        # Use a recursive bind so any existing submounts under `path` are part of
-        # the bind tree before we flip propagation flags. This matters for reboot
-        # recovery flows where /{project}/base may already be mounted before the
-        # product root itself is rebound as shared.
-        _sudo_run(["mount", "--rbind", path, path])
+        # Bind the path to itself before setting shared propagation.
+        # This ensures the path is a mount point before we flip propagation flags.
+        # The caller must ensure this is called before mounting any submounts under `path`.
+        _sudo_run(["mount", "--bind", path, path])
     _sudo_run(["mount", "--make-rshared", path])
     logger.info("Ensured shared mount propagation on %s", path)
 

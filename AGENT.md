@@ -453,19 +453,11 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 - AOSP 场景下，容器主要负责编译工作，不需要创建新的挂载点
 - `rslave` 仍满足核心需求：宿主机挂载/卸载 LV 后，容器内自动可见/消失
 
-这个设计有一个很重要的细节：**如果父目录在变成 shared mount 之前，其下已经存在子挂载，那么父目录的自绑定必须使用递归 bind（`mount --rbind path path`），不能只用普通 bind（`mount --bind path path`）。**
-
-典型问题场景如下：
-
-- `/home/bytedance/aosp-workspace/n1` 只是宿主机根盘上的普通目录
-- `/home/bytedance/aosp-workspace/n1/base` 是后续单独挂上的 LV
-- 若此时再对 `/home/bytedance/aosp-workspace/n1` 做普通 `--bind` + `--make-rshared`
-- 则这个 bind 树可能**不会把已经存在的 `base` 子挂载一起纳入传播树**
-- 结果就是：容器虽然看到了 `/{project}`，但看不到或看不正确 `/{project}/base`
+这个设计有一个很重要的细节：**必须在挂载任何子挂载之前，先确保父目录已经通过 `mount --bind path path` 绑定自身，然后再设置为 shared 模式。**
 
 因此当前实现约束为：
 
-1. `ensure_shared_mount(path)` 必须在需要时使用 `mount --rbind path path`
+1. `ensure_shared_mount(path)` 必须在需要时使用 `mount --bind path path`
 2. 然后再执行 `mount --make-rshared path`
 3. `mount` 命令在真正挂 base LV / workspace 快照之前，要先确保 product root 已被处理为 shared mount
 
