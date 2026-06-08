@@ -256,7 +256,7 @@ def docker_run(
         username = "user"
 
     cmd = ["docker", "run", "-itd", "--privileged=true", "--net", "host", "--name", name]
-    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rshared"])
+    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rslave"])
     cmd.extend(["-e", f"UID={uid}"])
     cmd.extend(["-e", f"GID={gid}"])
     cmd.extend(["-e", f"USERNAME={username}"])
@@ -284,7 +284,7 @@ def docker_create(
         username = "user"
 
     cmd = ["docker", "create", "-it", "--privileged=true", "--net", "host", "--name", name]
-    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rshared"])
+    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rslave"])
     cmd.extend(["-e", f"UID={uid}"])
     cmd.extend(["-e", f"GID={gid}"])
     cmd.extend(["-e", f"USERNAME={username}"])

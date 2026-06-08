@@ -441,6 +441,18 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 然后依赖 Linux mount propagation，让后续出现在该目录树下的子挂载（例如 `/{project}/base`、`/{project}/{workspace}`）自动在容器内可见。
 
+**传播模式选择：**
+
+- **宿主机端**：使用 `rshared` 模式（通过 `mount --make-rshared`），作为传播链的源头
+- **Docker 容器端**：使用 `rslave` 模式（通过 `bind-propagation=rslave`），作为传播链的接收端
+
+**为什么容器端使用 rslave 而不是 rshared：**
+
+- `rshared` 允许容器内的挂载操作传播回宿主机，存在安全风险
+- `rslave` 只允许宿主机→容器的单向传播，提供更好的隔离性
+- AOSP 场景下，容器主要负责编译工作，不需要创建新的挂载点
+- `rslave` 仍满足核心需求：宿主机挂载/卸载 LV 后，容器内自动可见/消失
+
 这个设计有一个很重要的细节：**如果父目录在变成 shared mount 之前，其下已经存在子挂载，那么父目录的自绑定必须使用递归 bind（`mount --rbind path path`），不能只用普通 bind（`mount --bind path path`）。**
 
 典型问题场景如下：
