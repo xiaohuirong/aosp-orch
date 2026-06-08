@@ -268,7 +268,6 @@ def _link_xxx(config_path: str):
         "--docker-image", "aosp-builder:mock",
         "--username", "user",
         "--base-lv-size-gb", "1",
-        "--sync-type", "repo",
     )
     assert result.returncode == 0, f"link failed: {result.stderr}"
 
@@ -285,7 +284,6 @@ class TestAssertion1Initialization:
             "--docker-image", "aosp-builder:mock",
             "--username", "user",
             "--base-lv-size-gb", "1",
-            "--sync-type", "repo",
         )
         assert result.returncode == 0, f"link failed: {result.stderr}"
         config = read_config(mock_config_path)
@@ -319,7 +317,6 @@ class TestAssertion1Initialization:
             "--docker-image", "aosp-builder:mock",
             "--username", "user",
             "--base-lv-size-gb", "1",
-            "--sync-type", "repo",
         )
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
