@@ -498,63 +498,6 @@ class TestSnapshotSpaceSaving:
         assert pct_b < 50.0, f"Snapshot b data_percent is {pct_b}%, expected < 50%"
 
 
-class TestGitSync:
-    """验证 git sync 模式：git clone 到 git-repo 子目录，git pull 增量更新。"""
-
-    def _link_aosp(self, config_path: str):
-        """Helper: link the aosp base project for git tests."""
-        result = run_cli(config_path,
-            "add", "--name", "aosp",
-            "--repo-url", "https://github.com/xiaohuirong/txt2sub",
-            "--repo-branch", "main",
-            "--docker-image", "alpine/git",
-            "--username", "user",
-            "--base-lv-size-gb", "1",
-            "--sync-type", "git",
-        )
-        assert result.returncode == 0, f"link failed: {result.stderr}"
-
-    def test_git_clone_to_git_repo_dir(self, prod_config_path):
-        """add should prepare git repo into /{project}/base/git-repo directory."""
-        self._link_aosp(prod_config_path)
-        run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
-        run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
-        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
-        assert result.returncode == 0, f"activate failed: {result.stderr}"
-
-        # Verify git-repo directory exists and has .git
-        from aosp_orch.storage import docker_exec
-        c_name = "aosp_aosp"
-        check = docker_exec(c_name, "test -d /aosp/base/git-repo/.git && echo EXISTS || echo MISSING")
-        assert "EXISTS" in check.stdout, f"git-repo/.git not found in container. Output: {check.stdout}"
-
-        # Verify repo content exists
-        check = docker_exec(c_name, "ls /aosp/base/git-repo/")
-        assert check.returncode == 0, f"Failed to list git-repo contents: {check.stderr}"
-
-    def test_git_pull_on_reactivate(self, prod_config_path):
-        """Re-activating should reuse the same product container and keep base git repo intact."""
-        self._link_aosp(prod_config_path)
-        run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
-        run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
-        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
-        assert result.returncode == 0, f"first activate failed: {result.stderr}"
-
-        # Deactivate
-        result = run_cli(prod_config_path, "stop", "feature-a", "--base", "aosp")
-        assert result.returncode == 0, f"deactivate failed: {result.stderr}"
-
-        # Re-activate: should simply start the shared product container again
-        result = run_cli(prod_config_path, "start", "feature-a", "--base", "aosp")
-        assert result.returncode == 0, f"re-activate failed: {result.stderr}"
-
-        # Verify git-repo still intact
-        from aosp_orch.storage import docker_exec
-        c_name = "aosp_aosp"
-        check = docker_exec(c_name, "test -d /aosp/base/git-repo/.git && echo EXISTS || echo MISSING")
-        assert "EXISTS" in check.stdout, f"git-repo/.git not found after re-activate. Output: {check.stdout}"
-
-
 class TestLoopRecovery:
     """验证 loop/VG 丢失时的恢复与错误提示行为。"""
 

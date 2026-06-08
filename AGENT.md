@@ -449,13 +449,6 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 
 所以任何关于 `enter` / `mount` / `start` 的实现调整，只要涉及容器可见性，都必须优先检查"父目录 bind 树是否正确承载了已有子挂载"。
 
-### Git 同步模式
-
-`sync_type: git` 时，代码同步到容器内 `/{project_name}/base/git-repo` 子目录：
-- **首次**：`git init` + `git remote add` + `git fetch` + `git checkout`
-- **已有 .git**：`git pull`；失败时询问用户是否清除重建
-- **挂载点根目录**保持干净，避免 git clone 到已存在目录的冲突
-
 ### 权限处理
 
 - 所有 LVM/mount 操作通过 `sudo` 执行
@@ -469,15 +462,6 @@ Thin snapshot 默认带 `activation skip` 标志（`k` 属性），必须用 `lv
 ### sync_type 支持
 
 base_project 支持 `sync_type` 字段：`repo`（默认）或 `git`。
-- repo: `repo init -u <url> -b <branch>` + `repo sync`
-- git: `git init` + `git remote add origin <url>` + `git fetch` + `git checkout -b <branch> origin/<branch>`
-
-### sync 不删除配置
-
-`sync` 命令会停止共享容器并销毁 workspace 快照（物理资源），**保留配置文件中的 workspace 条目**。用户下次需先 `new` + `mount` + `start`，无需重新在配置中添加 workspace。
-
-注意：`sync` 不要求销毁产品共享容器实例本身；常规路径下只 stop，共享容器可在后续 `start` 时再次 start。
-
 ---
 
 ## 七、 测试
@@ -494,7 +478,7 @@ uv run pytest test_orchestrator.py -v
 由于 `add` 命令现在支持 `base_projects[].username`，测试中凡是走非交互 `add --name ...` 路径的地方，都应显式传入 `--username user`，否则会被识别为交互模式并等待用户输入。
 
 - Mock 测试：workdir = `/tmp/aosp_test_mock`，项目名 `xxx`，Docker 镜像 `aosp-builder:mock`
-- Prod/Git 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`，sync_type = git
+- Prod 测试：workdir = `/tmp/aosp_test_prod`，项目名 `aosp`，Docker 镜像 `alpine/git`
 
 ### 11 个测试用例
 
@@ -509,8 +493,6 @@ uv run pytest test_orchestrator.py -v
 | 空间 | `test_snapshot_data_percent_is_low` | 新快照 data_percent 低（共享基座） |
 | 空间 | `test_snapshot_only_stores_deltas` | 写入后 data_percent 增长（仅存增量） |
 | 空间 | `test_multiple_snapshots_share_base` | 多快照共享基座数据 |
-| Git | `test_git_clone_to_git_repo_dir` | git sync 模式下代码位于 /{project}/base/git-repo |
-| Git | `test_git_pull_on_reactivate` | 重新 start 时复用共享容器且 base git-repo 仍保留 |
 
 ### 针对 loop 恢复问题的补充测试
 

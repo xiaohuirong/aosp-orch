@@ -388,32 +388,6 @@ def _ensure_pool_and_vg(config: dict) -> None:
     init_lvm_thin_pool(loop_dev, VG_NAME, THIN_POOL_NAME)
 
 
-def _run_sync(c_name: str, bp: dict) -> None:
-    """Run sync commands inside a container based on project's sync_type."""
-    sync_type = bp.get("sync_type", "repo")
-    project_dir = bp["name"]
-    base_dir = f"/{project_dir}/base"
-    repo_url = bp["repo_url"]
-    repo_branch = bp["repo_branch"]
-
-    if sync_type == "git":
-        git_repo_dir = f"{base_dir}/git-repo"
-        check = docker_exec(c_name, f"test -d {git_repo_dir}/.git && echo EXISTS || echo MISSING")
-        if "EXISTS" in check.stdout:
-            result = docker_exec(c_name, f"cd {git_repo_dir} && git pull", check=False)
-            if result.returncode != 0:
-                click.echo(f"git pull 失败: {result.stderr}")
-                if click.confirm("是否清除目录并重新 git clone?", default=True):
-                    docker_exec(c_name, f"rm -rf {git_repo_dir}")
-                    docker_exec(c_name, f"git clone -b {repo_branch} {repo_url} {git_repo_dir}")
-                else:
-                    click.echo("跳过同步，继续后续操作。")
-        else:
-            docker_exec(c_name, f"git clone -b {repo_branch} {repo_url} {git_repo_dir}")
-    else:
-        docker_exec(c_name, f"cd {base_dir} && repo init -u {repo_url} -b {repo_branch}")
-        docker_exec(c_name, f"cd {base_dir} && repo sync")
-
 
 def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
     """Populate base LV with content (mount, fill, unmount).
@@ -451,7 +425,6 @@ def _populate_base(config: dict, bp: dict, force: bool = False) -> None:
     else:
         build_config = bp.get("build_config", {})
         c_name = _start_container(config, bp)
-        _run_sync(c_name, bp)
         for cmd in build_config.get("setup_commands", []):
             docker_exec(c_name, f"cd /{project_name}/base && {cmd}")
         compile_cmd = build_config.get("compile_command", "")
@@ -634,10 +607,8 @@ def init(ctx, mode, workdir, pool_image_size_gb):
 @click.option("--docker-image", default=None, help="Docker 镜像名称")
 @click.option("--username", default=None, help="该 base project 对应容器注入的 USERNAME 环境变量")
 @click.option("--base-lv-size-gb", type=int, default=None, help="基底卷大小 (GB)")
-@click.option("--sync-type", type=click.Choice(["repo", "git"]), default=None,
-              help="代码同步方式: repo (默认) | git")
 @click.pass_context
-def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_size_gb, sync_type):
+def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_size_gb):
     """配置 base project 并创建 base LV（格式化 + 填充内容）。"""
     config_path = ctx.obj["config_path"]
 
@@ -658,7 +629,7 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
     mode = g["mode"]
 
     # Check if all add-specific options are provided
-    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, username, base_lv_size_gb, sync_type])
+    all_provided = all(v is not None for v in [name, repo_url, repo_branch, docker_image, username, base_lv_size_gb])
 
     if all_provided:
         bp_name = name
@@ -679,7 +650,6 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
             "name": bp_name,
             "repo_url": repo_url or "https://android.googlesource.com/platform/manifest",
             "repo_branch": repo_branch or "main",
-            "sync_type": sync_type or "repo",
             "docker_image": docker_image or ("aosp-builder:mock" if mode == "mock" else "aosp-builder:latest"),
             "username": username or _default_username(),
             "base_lv_size_gb": base_lv_size_gb or (1 if mode == "mock" else 100),
@@ -696,8 +666,6 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
             bp["repo_url"] = repo_url
         if repo_branch is not None:
             bp["repo_branch"] = repo_branch
-        if sync_type is not None:
-            bp["sync_type"] = sync_type
         if docker_image is not None:
             bp["docker_image"] = docker_image
         if username is not None:
@@ -708,8 +676,6 @@ def add_cmd(ctx, name, repo_url, repo_branch, docker_image, username, base_lv_si
     if not all_provided:
         bp["repo_url"] = click.prompt("清单仓库地址", default=bp["repo_url"])
         bp["repo_branch"] = click.prompt("清单分支", default=bp["repo_branch"])
-        bp.setdefault("sync_type", "repo")
-        bp["sync_type"] = click.prompt("同步方式 (repo/git)", default=bp["sync_type"])
         bp["docker_image"] = click.prompt("Docker 镜像", default=bp["docker_image"])
         bp.setdefault("username", _default_username())
         bp["username"] = click.prompt("容器 USERNAME", default=bp["username"])
