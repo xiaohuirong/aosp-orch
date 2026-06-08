@@ -810,6 +810,7 @@ def mount_cmd(ctx, workspace_name, base):
     _require_storage_runtime(config)
 
     project_name = bp["name"]
+    _ensure_product_root_dir(config, project_name)
 
     if workspace_name is None:
         # Mount base LV directly

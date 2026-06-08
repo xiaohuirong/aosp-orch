@@ -666,6 +666,7 @@ class TestLoopRecovery:
         monkeypatch.setattr(main_mod, "is_lv_mounted", lambda _vg, _lv: False)
         monkeypatch.setattr(main_mod, "activate_lv", lambda _vg, _lv: None)
         monkeypatch.setattr(main_mod, "mount", fake_mount)
+        monkeypatch.setattr(main_mod, "ensure_shared_mount", lambda _path: None)
         monkeypatch.setattr(main_mod, "docker_container_running", lambda _name: True)
         monkeypatch.setattr(main_mod.os, "execvp", fake_execvp)
 
@@ -712,3 +713,73 @@ class TestLoopRecovery:
         assert "LVM 基础设施不存在" in result.output, result.output
         assert "请先运行 'init'" in result.output, result.output
         assert "Base LV 'n1' 不存在" not in result.output, result.output
+
+
+class TestMountPropagation:
+    """验证挂载传播相关回归场景。"""
+
+    def test_ensure_shared_mount_uses_rbind_for_existing_submounts(self, monkeypatch):
+        """ensure_shared_mount should use recursive bind so existing submounts propagate into containers."""
+        import aosp_orch.storage as storage_mod
+
+        calls = []
+
+        def fake_sudo_run(cmd, check=True, capture=True):
+            calls.append(cmd)
+            if cmd[:2] == ["mountpoint", "-q"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(storage_mod, "_sudo_run", fake_sudo_run)
+        monkeypatch.setattr(storage_mod.os, "makedirs", lambda *args, **kwargs: None)
+
+        storage_mod.ensure_shared_mount("/tmp/aosp-propagation-test")
+
+        assert ["mount", "--rbind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] in calls
+        assert ["mount", "--bind", "/tmp/aosp-propagation-test", "/tmp/aosp-propagation-test"] not in calls
+
+    def test_mount_ensures_shared_product_root_before_mounting_lv(self, tmp_path, monkeypatch):
+        """mount should prepare the product root as shared before mounting base/workspace LVs."""
+        config_path = str(tmp_path / "config.yaml")
+        workdir = str(tmp_path / "workdir")
+        config = {
+            "global": {
+                "mode": "mock",
+                "workdir": workdir,
+                "pool_image_size_gb": 2,
+                "default_base": "n1",
+            },
+            "base_projects": [
+                {
+                    "name": "n1",
+                    "repo_url": "https://github.com/mock/manifest.git",
+                    "repo_branch": "main",
+                    "docker_image": "aosp-builder:mock",
+                    "base_lv_size_gb": 1,
+                    "workspaces": [],
+                },
+            ],
+        }
+        write_config(config_path, config)
+
+        import aosp_orch.main as main_mod
+
+        order = []
+
+        def fake_ensure_product_root_dir(_config, _project_name):
+            order.append("ensure_root")
+            return os.path.join(workdir, "n1")
+
+        def fake_mount_lv(_lv_name, _mount_path):
+            order.append("mount_lv")
+
+        monkeypatch.setattr(main_mod, "_require_storage_runtime", lambda _config: None)
+        monkeypatch.setattr(main_mod, "_ensure_product_root_dir", fake_ensure_product_root_dir)
+        monkeypatch.setattr(main_mod, "lv_exists", lambda _vg, _lv: True)
+        monkeypatch.setattr(main_mod, "_mount_lv", fake_mount_lv)
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--config", config_path, "mount", "--base", "n1"])
+
+        assert result.exit_code == 0, result.output
+        assert order == ["ensure_root", "mount_lv"], order
