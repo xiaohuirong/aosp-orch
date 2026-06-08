@@ -350,28 +350,29 @@ class TestAssertion2SnapshotIsolation:
     def test_workspace_isolation(self, mock_config_path):
         """Files in workspace A must not be visible in workspace B."""
         _link_xxx(mock_config_path)
-        # Create and activate workspace a
+        # Create, mount and activate workspace a
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
-        # Write ai_code.txt in workspace a container
+        # Write ai_code.txt in workspace a path inside the shared product container
         from aosp_orch.storage import docker_exec
-        c_name_a = "aosp_xxx_a"
-        docker_exec(c_name_a, "echo 'AI was here' > /xxx/ai_code.txt")
+        c_name = "aosp_xxx"
+        docker_exec(c_name, "echo 'AI was here' > /xxx/a/ai_code.txt")
 
         # Verify file exists in a
-        result = docker_exec(c_name_a, "cat /xxx/ai_code.txt")
+        result = docker_exec(c_name, "cat /xxx/a/ai_code.txt")
         assert "AI was here" in result.stdout, "ai_code.txt not written in workspace a"
 
-        # Create and activate workspace b
+        # Create, mount and activate workspace b
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # ASSERT ai_code.txt must NOT exist in workspace b
-        c_name_b = "aosp_xxx_b"
-        result = docker_exec(c_name_b, "ls /xxx/ai_code.txt 2>&1; echo EXIT_CODE=$?")
+        result = docker_exec(c_name, "ls /xxx/b/ai_code.txt 2>&1; echo EXIT_CODE=$?")
         assert "ai_code.txt" not in result.stdout or "No such file" in result.stdout, \
             f"ISOLATION FAILURE: ai_code.txt visible in workspace b! Output: {result.stdout}"
 
@@ -379,47 +380,49 @@ class TestAssertion2SnapshotIsolation:
 class TestAssertion3DeactivationIdempotency:
     """断言 3: 去激活幂等性验证"""
 
-    def test_deactivate_unmounts_and_stops_container(self, mock_config_path):
-        """After deactivate, snapshot LV must be unmounted and container stopped but preserved."""
+    def test_deactivate_stops_container_only(self, mock_config_path):
+        """After deactivate, container should stop but workspace mount should remain."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         # Verify it's active
-        assert docker_container_exists("aosp_xxx_a"), \
-            "Container aosp_xxx_a should exist after activate"
-        assert docker_container_running("aosp_xxx_a"), \
-            "Container aosp_xxx_a should be running after activate"
+        assert docker_container_exists("aosp_xxx"), \
+            "Container aosp_xxx should exist after activate"
+        assert docker_container_running("aosp_xxx"), \
+            "Container aosp_xxx should be running after activate"
 
         # Deactivate
         result = run_cli(mock_config_path, "deactivate", "a", "--base", "xxx")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
-        # Assert: mount | grep s-a must return empty
+        # Assert: mount remains because deactivate no longer unmounts
         mount_result = run_cmd(["mount"])
-        assert "s-a" not in mount_result.stdout, \
-            f"s-a still mounted after deactivate"
+        assert "s-a" in mount_result.stdout or _workspace_mount_path(read_config(mock_config_path), "xxx", "a") in mount_result.stdout, \
+            f"workspace a should remain mounted after deactivate"
 
         # Assert: Docker container should still exist but be stopped
-        assert docker_container_exists("aosp_xxx_a"), \
-            "Container aosp_xxx_a should be preserved after deactivate"
-        assert not docker_container_running("aosp_xxx_a"), \
-            "Container aosp_xxx_a should be stopped after deactivate"
+        assert docker_container_exists("aosp_xxx"), \
+            "Container aosp_xxx should be preserved after deactivate"
+        assert not docker_container_running("aosp_xxx"), \
+            "Container aosp_xxx should be stopped after deactivate"
 
     def test_reactivate_reuses_persisted_container(self, mock_config_path):
         """Re-activate should reuse the persisted container instead of creating a new one."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
 
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"first activate failed: {result.stderr}"
 
         config = read_config(mock_config_path)
-        ws = config["base_projects"][0]["workspaces"][0]
-        assert ws.get("container") == "aosp_xxx_a", "workspace container should be persisted in config"
+        bp = config["base_projects"][0]
+        assert bp.get("default_container") == "aosp_xxx", "product container should be persisted in config"
 
-        inspect_before = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx_a"])
+        inspect_before = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx"])
         assert inspect_before.returncode == 0, f"inspect before failed: {inspect_before.stderr}"
         container_id_before = inspect_before.stdout.strip()
 
@@ -429,7 +432,7 @@ class TestAssertion3DeactivationIdempotency:
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"second activate failed: {result.stderr}"
 
-        inspect_after = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx_a"])
+        inspect_after = run_cmd(["docker", "inspect", "-f", "{{.Id}}", "aosp_xxx"])
         assert inspect_after.returncode == 0, f"inspect after failed: {inspect_after.stderr}"
         container_id_after = inspect_after.stdout.strip()
 
@@ -444,16 +447,18 @@ class TestAssertion4ForceSync:
         _link_xxx(mock_config_path)
         # Setup: create + activate a and b
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate a failed: {result.stderr}"
 
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"activate b failed: {result.stderr}"
 
         # Write something in b to make it dirty
         from aosp_orch.storage import docker_exec
-        docker_exec("aosp_xxx_b", "echo 'dirty data' > /xxx/dirty.txt")
+        docker_exec("aosp_xxx", "echo 'dirty data' > /xxx/b/dirty.txt")
 
         # Run sync
         result = run_cli(mock_config_path, "sync", "--base", "xxx")
@@ -474,6 +479,7 @@ class TestAssertion4ForceSync:
 
         # Re-create b (snapshot was destroyed by sync, config entry kept) then activate
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "b", "--base", "xxx")
         assert result.returncode == 0, f"re-activate b failed: {result.stderr}"
 
@@ -482,7 +488,7 @@ class TestAssertion4ForceSync:
             "s-b not recreated on create+activate after sync"
 
         # Assert: b is in clean state (no dirty.txt from before)
-        result = docker_exec("aosp_xxx_b", "ls /xxx/dirty.txt 2>&1; echo EXIT_CODE=$?")
+        result = docker_exec("aosp_xxx", "ls /xxx/b/dirty.txt 2>&1; echo EXIT_CODE=$?")
         assert "dirty.txt" not in result.stdout or "No such file" in result.stdout, \
             f"Workspace b is not clean after sync+activate! Output: {result.stdout}"
 
@@ -494,6 +500,7 @@ class TestSnapshotSpaceSaving:
         """A freshly created snapshot should have very low data_percent (space saving)."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
@@ -505,6 +512,7 @@ class TestSnapshotSpaceSaving:
         """Writing to a workspace should increase data_percent."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         result = run_cli(mock_config_path, "activate", "a", "--base", "xxx")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
@@ -512,8 +520,8 @@ class TestSnapshotSpaceSaving:
 
         # Write data to the workspace
         from aosp_orch.storage import docker_exec
-        result = docker_exec("aosp_xxx_a", "dd if=/dev/zero of=/xxx/test_large_file bs=1M count=20 2>&1 && sync")
-        check = docker_exec("aosp_xxx_a", "ls -la /xxx/test_large_file 2>&1")
+        result = docker_exec("aosp_xxx", "dd if=/dev/zero of=/xxx/a/test_large_file bs=1M count=20 2>&1 && sync")
+        check = docker_exec("aosp_xxx", "ls -la /xxx/a/test_large_file 2>&1")
         assert "test_large_file" in check.stdout, f"Failed to write test_large_file: {check.stdout}"
 
         run_cmd(["sync"])
@@ -528,9 +536,11 @@ class TestSnapshotSpaceSaving:
         """Multiple workspaces should share the base data, not duplicate it."""
         _link_xxx(mock_config_path)
         run_cli(mock_config_path, "new", "a", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "a", "--base", "xxx")
         run_cli(mock_config_path, "activate", "a", "--base", "xxx")
 
         run_cli(mock_config_path, "new", "b", "--base", "xxx")
+        run_cli(mock_config_path, "mount", "b", "--base", "xxx")
         run_cli(mock_config_path, "activate", "b", "--base", "xxx")
 
         pct_a = get_lv_data_percent(VG_NAME, _snapshot_lv_name("a"))
@@ -557,27 +567,28 @@ class TestGitSync:
         assert result.returncode == 0, f"link failed: {result.stderr}"
 
     def test_git_clone_to_git_repo_dir(self, prod_config_path):
-        """activate should git clone into /{project}/git-repo directory."""
+        """add should prepare git repo into /{project}/base/git-repo directory."""
         self._link_aosp(prod_config_path)
         run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
+        run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
         result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"activate failed: {result.stderr}"
 
         # Verify git-repo directory exists and has .git
         from aosp_orch.storage import docker_exec
-        c_name = "aosp_aosp_feature-a"
-        check = docker_exec(c_name, "test -d /aosp/git-repo/.git && echo EXISTS || echo MISSING")
+        c_name = "aosp_aosp"
+        check = docker_exec(c_name, "test -d /aosp/base/git-repo/.git && echo EXISTS || echo MISSING")
         assert "EXISTS" in check.stdout, f"git-repo/.git not found in container. Output: {check.stdout}"
 
         # Verify repo content exists
-        check = docker_exec(c_name, "ls /aosp/git-repo/")
+        check = docker_exec(c_name, "ls /aosp/base/git-repo/")
         assert check.returncode == 0, f"Failed to list git-repo contents: {check.stderr}"
 
     def test_git_pull_on_reactivate(self, prod_config_path):
-        """Re-activating after sync should git pull instead of git clone."""
+        """Re-activating should reuse the same product container and keep base git repo intact."""
         self._link_aosp(prod_config_path)
-        # First activate: git clone
         run_cli(prod_config_path, "new", "feature-a", "--base", "aosp")
+        run_cli(prod_config_path, "mount", "feature-a", "--base", "aosp")
         result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"first activate failed: {result.stderr}"
 
@@ -585,12 +596,12 @@ class TestGitSync:
         result = run_cli(prod_config_path, "deactivate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"deactivate failed: {result.stderr}"
 
-        # Re-activate: should git pull (not fail)
+        # Re-activate: should simply start the shared product container again
         result = run_cli(prod_config_path, "activate", "feature-a", "--base", "aosp")
         assert result.returncode == 0, f"re-activate failed: {result.stderr}"
 
         # Verify git-repo still intact
         from aosp_orch.storage import docker_exec
-        c_name = "aosp_aosp_feature-a"
-        check = docker_exec(c_name, "test -d /aosp/git-repo/.git && echo EXISTS || echo MISSING")
+        c_name = "aosp_aosp"
+        check = docker_exec(c_name, "test -d /aosp/base/git-repo/.git && echo EXISTS || echo MISSING")
         assert "EXISTS" in check.stdout, f"git-repo/.git not found after re-activate. Output: {check.stdout}"

@@ -197,6 +197,16 @@ def is_lv_mounted(vg_name: str, lv_name: str) -> bool:
     return f"/dev/{vg_name}/{lv_name}" in result.stdout or f"/dev/mapper/{vg_name}-{lv_name}" in result.stdout
 
 
+def ensure_shared_mount(path: str) -> None:
+    """Ensure a path is a shared bind mount so submount propagation is visible."""
+    os.makedirs(path, exist_ok=True)
+    result = _sudo_run(["mountpoint", "-q", path], check=False)
+    if result.returncode != 0:
+        _sudo_run(["mount", "--bind", path, path])
+    _sudo_run(["mount", "--make-rshared", path])
+    logger.info("Ensured shared mount propagation on %s", path)
+
+
 # ── Docker ────────────────────────────────────────────────────
 
 def docker_build_mock(image_name: str) -> None:
@@ -242,7 +252,7 @@ def docker_run(
         username = "user"
 
     cmd = ["docker", "run", "-itd", "--privileged=true", "--net", "host", "--name", name]
-    cmd.extend(["-v", f"{mount_path}:{volume_dest}"])
+    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rshared"])
     cmd.extend(["-e", f"UID={uid}"])
     cmd.extend(["-e", f"GID={gid}"])
     cmd.extend(["-e", f"USERNAME={username}"])
@@ -250,6 +260,34 @@ def docker_run(
     cmd.extend(["sleep", "infinity"])
     _run(cmd)
     logger.info("Container '%s' started", name)
+
+
+def docker_create(
+    name: str,
+    mount_path: str,
+    volume_dest: str,
+    image: str,
+    uid: int | None = None,
+    gid: int | None = None,
+    username: str | None = None,
+) -> None:
+    """Create a stopped container with the default AOSP build settings."""
+    if uid is None:
+        uid = os.getuid()
+    if gid is None:
+        gid = os.getgid()
+    if username is None:
+        username = "user"
+
+    cmd = ["docker", "create", "-it", "--privileged=true", "--net", "host", "--name", name]
+    cmd.extend(["--mount", f"type=bind,src={mount_path},dst={volume_dest},bind-propagation=rshared"])
+    cmd.extend(["-e", f"UID={uid}"])
+    cmd.extend(["-e", f"GID={gid}"])
+    cmd.extend(["-e", f"USERNAME={username}"])
+    cmd.append(image)
+    cmd.extend(["sleep", "infinity"])
+    _run(cmd)
+    logger.info("Container '%s' created", name)
 
 
 def docker_exec(name: str, command: str, interactive: bool = False, check: bool = True) -> subprocess.CompletedProcess:
